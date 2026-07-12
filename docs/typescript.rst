@@ -83,7 +83,8 @@ Python                               TypeScript
 
 Type aliases (a `typing.NewType` or a :pep:`695` ``type X = ...``) are
 preserved as ``type`` aliases when present. Array-like structs and named-tuples
-render as positional tuple types.
+render as ordinary object ``class`` definitions - their array-on-the-wire form
+is handled by the codec (see below), not the schema.
 
 
 Encoders and decoders

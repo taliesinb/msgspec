@@ -138,21 +138,40 @@ def test_tagged_union():
     assert "export type Root = Cat | Dog;" in out
 
 
-def test_array_like_struct_is_tuple():
+def test_array_like_struct_is_class():
+    # array_like structs are classes in the schema (the array wire form is a
+    # codec concern, not a schema one).
     class Rec(Struct, array_like=True):
         a: int
         b: str = "x"
 
     out = ts(Rec)
-    assert "export type Rec = [number, string];" in out
+    assert "export class Rec {" in out
+    assert "  a: number;" in out
+    assert "  b?: string;" in out
 
 
-def test_array_like_tagged_struct_prepends_tag():
+def test_array_like_tagged_struct_is_class_with_tag():
     class Rec(Struct, array_like=True, tag="rec"):
         a: int
 
     out = ts(Rec)
-    assert 'export type Rec = ["rec", number];' in out
+    assert "export class Rec {" in out
+    assert '  type: "rec";' in out
+    assert "  a: number;" in out
+
+
+def test_namedtuple_is_class():
+    from typing import NamedTuple
+
+    class Point(NamedTuple):
+        x: int
+        y: int
+
+    out = ts(Point)
+    assert "export class Point {" in out
+    assert "  x: number;" in out
+    assert "  y: number;" in out
 
 
 def test_renamed_field_quoted_when_needed():
@@ -274,14 +293,39 @@ class TestCodec:
         assert "export type Root = Array<P>;" in out
         assert "value.map((v) => encodeP(v))" in out
 
-    def test_array_like_struct_positional(self):
+    def test_array_like_struct_object_array_bridge(self):
+        # array_like structs are objects in TS; the codec bridges to an array.
         class Rec(Struct, array_like=True):
             a: int
             b: str
 
         out = cc(Rec)
-        assert "return [value[0], value[1]];" in out
+        assert "export class Rec {" in out
+        assert 'return [value["a"], value["b"]];' in out  # encode: object -> array
         assert "const a = data as unknown[];" in out
+        assert "a: (a[0] as number)," in out  # decode: array -> object
+
+    def test_namedtuple_object_array_bridge(self):
+        from typing import NamedTuple
+
+        class Point(NamedTuple):
+            x: int
+            y: int
+
+        out = cc(Point)
+        assert "export class Point {" in out
+        assert 'return [value["x"], value["y"]];' in out
+        assert "x: (a[0] as number)," in out
+
+    def test_tagged_array_like_bridge(self):
+        class Rec(Struct, array_like=True, tag="rec"):
+            a: int
+
+        out = cc(Rec)
+        # tag is the first wire array element; decoded object carries it back
+        assert 'return ["rec", value["a"]];' in out
+        assert '    type: "rec",' in out
+        assert "a: (a[1] as number)," in out
 
     def test_enum_and_alias_identity(self):
         import enum

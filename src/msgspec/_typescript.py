@@ -329,17 +329,19 @@ class _SchemaGenerator:
             raise TypeError(f"TypeScript schema doesn't support type {t!r}")
 
     def to_def(self, name: str, t: mi.Type) -> str:
-        """Render a nameable Type as a top-level TypeScript definition."""
+        """Render a nameable Type as a top-level TypeScript definition.
+
+        Structs (object- and array-like), dataclasses, typed-dicts, and
+        named-tuples all become object `class` definitions - the array-on-wire
+        shape of array-like structs and named-tuples is handled by the codec,
+        not the schema.
+        """
         if isinstance(t, mi.AliasType):
             return f"export type {name} = {self.to_ref(t.value)};"
         elif isinstance(t, mi.EnumType):
             return self._enum_def(name, t)
-        elif isinstance(t, mi.StructType) and t.array_like:
-            return self._array_struct_def(name, t)
-        elif isinstance(t, mi.NamedTupleType):
-            return self._namedtuple_def(name, t)
         else:
-            # Struct (object-like), TypedDict, Dataclass
+            # Struct, TypedDict, Dataclass, NamedTuple
             return self._object_def(name, t)
 
     def _enum_def(self, name: str, t: mi.EnumType) -> str:
@@ -371,27 +373,6 @@ class _SchemaGenerator:
         for field in t.fields:
             lines.append(self._field_line(field))
         lines.append("}")
-        return "\n".join(lines)
-
-    def _array_struct_def(self, name: str, t: mi.StructType) -> str:
-        # array_like structs encode as fixed tuples.
-        lines = []
-        if doc := _get_doc(t):
-            lines.append(_jsdoc(doc).rstrip("\n"))
-        elems = []
-        if t.tag_field is not None:
-            elems.append(_literal_value(t.tag))
-        elems.extend(self.to_ref(f.type) for f in t.fields)
-        lines.append(f"export type {name} = [{', '.join(elems)}];")
-        return "\n".join(lines)
-
-    def _namedtuple_def(self, name: str, t: mi.NamedTupleType) -> str:
-        # NamedTuples encode as arrays.
-        lines = []
-        if doc := _get_doc(t):
-            lines.append(_jsdoc(doc).rstrip("\n"))
-        elems = ", ".join(self.to_ref(f.type) for f in t.fields)
-        lines.append(f"export type {name} = [{elems}];")
         return "\n".join(lines)
 
 
@@ -659,14 +640,13 @@ class _CodecGenerator:
         return "\n".join(lines)
 
     def _enc_array_def(self, name: str, t: mi.Type) -> str:
-        # NamedTuple / array_like struct: encodes to a positional array.
-        offset = 0
+        # NamedTuple / array_like struct: the TS value is an object (named
+        # fields), but the wire form is a positional array (tag first if tagged).
         head = []
         if isinstance(t, mi.StructType) and t.tag_field is not None:
             head.append(_literal_value(t.tag))
-            offset = 1
         elems = head + [
-            self.enc(f.type, f"value[{i + offset}]") for i, f in enumerate(t.fields)
+            self.enc(f.type, f"value[{_str(f.encode_name)}]") for f in t.fields
         ]
         body = ", ".join(elems)
         return (
@@ -675,20 +655,26 @@ class _CodecGenerator:
         )
 
     def _dec_array_def(self, name: str, t: mi.Type) -> str:
+        # Inverse of `_enc_array_def`: a positional wire array back into an
+        # object with named fields.
+        lines = [f"export function decode{name}(data: unknown): {name} {{"]
+        lines.append(f"{_INDENT}const a = data as unknown[];")
+        lines.append(f"{_INDENT}return {{")
         offset = 0
-        head = []
         if isinstance(t, mi.StructType) and t.tag_field is not None:
-            head.append(_literal_value(t.tag))
+            lines.append(
+                f"{_INDENT}{_INDENT}{_prop_name(t.tag_field)}: "
+                f"{_literal_value(t.tag)},"
+            )
             offset = 1
-        elems = head + [
-            self.dec(f.type, f"a[{i + offset}]") for i, f in enumerate(t.fields)
-        ]
-        body = ", ".join(elems)
-        return (
-            f"export function decode{name}(data: unknown): {name} {{\n"
-            f"{_INDENT}const a = data as unknown[];\n"
-            f"{_INDENT}return [{body}] as {name};\n}}"
-        )
+        for i, f in enumerate(t.fields):
+            key = _prop_name(f.encode_name)
+            lines.append(
+                f"{_INDENT}{_INDENT}{key}: {self.dec(f.type, f'a[{i + offset}]')},"
+            )
+        lines.append(f"{_INDENT}}} as {name};")
+        lines.append("}")
+        return "\n".join(lines)
 
 
 def _contains_tensor(t: mi.Type, _seen: set | None = None) -> bool:
