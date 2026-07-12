@@ -464,9 +464,16 @@ class _CodecGenerator:
     dispatch on that tag. Validation is intentionally not performed.
     """
 
-    def __init__(self, name_map: dict[Any, str]):
+    def __init__(
+        self,
+        name_map: dict[Any, str],
+        tensor_encoder: str | None = None,
+        tensor_decoder: str | None = None,
+    ):
         self.name_map = name_map
         self.schema = _SchemaGenerator(name_map)
+        self.tensor_encoder = tensor_encoder
+        self.tensor_decoder = tensor_decoder
 
     # -- expression helpers -------------------------------------------------
     def enc(self, t: mi.Type, expr: str) -> str:
@@ -474,6 +481,12 @@ class _CodecGenerator:
         t = _unwrap(t)
         if _is_identity(t):
             return expr
+        if isinstance(t, mi.TensorType):
+            if self.tensor_encoder is None:
+                raise TypeError(
+                    "codec() requires `tensor_encoder` to encode tensor types"
+                )
+            return f"{self.tensor_encoder}({expr})"
         if isinstance(t, _CODEC_FUNC_TYPES):
             return f"encode{self.name_map[t.cls]}({expr})"
         if isinstance(t, mi.AliasType):
@@ -504,6 +517,12 @@ class _CodecGenerator:
         t = _unwrap(t)
         if _is_identity(t):
             return f"({expr} as {self.schema.to_ref(t)})"
+        if isinstance(t, mi.TensorType):
+            if self.tensor_decoder is None:
+                raise TypeError(
+                    "codec() requires `tensor_decoder` to decode tensor types"
+                )
+            return f"{self.tensor_decoder}({expr} as TensorHandle)"
         if isinstance(t, _CODEC_FUNC_TYPES):
             return f"decode{self.name_map[t.cls]}({expr})"
         if isinstance(t, mi.AliasType):
@@ -672,6 +691,97 @@ class _CodecGenerator:
         )
 
 
+def _contains_tensor(t: mi.Type, _seen: set | None = None) -> bool:
+    """Whether a `TensorType` appears anywhere in the type tree."""
+    if _seen is None:
+        _seen = set()
+    t = _unwrap(t)
+    if isinstance(t, mi.TensorType):
+        return True
+    if hasattr(t, "cls"):
+        if t.cls in _seen:
+            return False
+        _seen.add(t.cls)
+    if isinstance(t, (mi.StructType, mi.TypedDictType, mi.DataclassType, mi.NamedTupleType)):
+        return any(_contains_tensor(f.type, _seen) for f in t.fields)
+    if isinstance(t, mi.AliasType):
+        return _contains_tensor(t.value, _seen)
+    if isinstance(t, (mi.ListType, mi.VarTupleType, mi.SetType, mi.FrozenSetType)):
+        return _contains_tensor(t.item_type, _seen)
+    if isinstance(t, mi.TupleType):
+        return any(_contains_tensor(i, _seen) for i in t.item_types)
+    if isinstance(t, (mi.DictType, mi.FrozenDictType)):
+        return _contains_tensor(t.key_type, _seen) or _contains_tensor(t.value_type, _seen)
+    if isinstance(t, mi.UnionType):
+        return any(_contains_tensor(m, _seen) for m in t.types)
+    return False
+
+
+# TypeScript runtime for tensors: a `TensorHandle` class plus an
+# `@msgpack/msgpack` ExtensionCodec that serializes it to/from the reserved
+# ext type 84, byte-compatible with msgspec's payload
+# (version + dtype code + shape[u64 BE] + raw bytes).
+_TENSOR_RUNTIME = '''\
+const _TENSOR_DTYPES = ["uint8", "uint16", "uint32", "uint64", "int8", "int16", "int32", "int64", "float32", "float64", "bool"];
+const _TENSOR_EXT_TYPE = 84;
+
+export class TensorHandle {
+  data: Uint8Array;
+  dtype: string | null;
+  shape: number[] | null;
+  constructor(data: Uint8Array, dtype: string | null = null, shape: number[] | null = null) {
+    this.data = data;
+    this.dtype = dtype;
+    this.shape = shape;
+  }
+}
+
+function _encodeTensorHandle(h: TensorHandle): Uint8Array {
+  const ndim = h.shape === null ? 0 : h.shape.length;
+  const headerLen = 3 + (h.shape === null ? 0 : 8 * ndim);
+  const out = new Uint8Array(headerLen + h.data.length);
+  const view = new DataView(out.buffer);
+  out[0] = 1;
+  out[1] = h.dtype === null ? 0xff : _TENSOR_DTYPES.indexOf(h.dtype);
+  out[2] = h.shape === null ? 0xff : ndim;
+  let off = 3;
+  if (h.shape !== null) {
+    for (const s of h.shape) {
+      view.setBigUint64(off, BigInt(s), false);
+      off += 8;
+    }
+  }
+  out.set(h.data, off);
+  return out;
+}
+
+function _decodeTensorHandle(data: Uint8Array): TensorHandle {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const dcode = data[1];
+  const ndimByte = data[2];
+  let off = 3;
+  let shape: number[] | null = null;
+  if (ndimByte !== 0xff) {
+    shape = [];
+    for (let i = 0; i < ndimByte; i++) {
+      shape.push(Number(view.getBigUint64(off, false)));
+      off += 8;
+    }
+  }
+  const dtype = dcode === 0xff ? null : _TENSOR_DTYPES[dcode];
+  return new TensorHandle(data.slice(off), dtype, shape);
+}
+
+const _extensionCodec = new ExtensionCodec();
+_extensionCodec.register({
+  type: _TENSOR_EXT_TYPE,
+  encode: (input: unknown): Uint8Array | null =>
+    input instanceof TensorHandle ? _encodeTensorHandle(input) : null,
+  decode: (data: Uint8Array): TensorHandle => _decodeTensorHandle(data),
+});
+const _codecOptions = { extensionCodec: _extensionCodec };'''
+
+
 def _str_inner(s: str) -> str:
     """Escape a string for use inside a double-quoted TS string literal."""
     return s.replace("\\", "\\\\").replace('"', '\\"')
@@ -682,7 +792,12 @@ def _str(s: str) -> str:
     return f'"{_str_inner(s)}"'
 
 
-def codec(type: Any) -> str:
+def codec(
+    type: Any,
+    *,
+    tensor_encoder: str | None = None,
+    tensor_decoder: str | None = None,
+) -> str:
     """Generate TypeScript type definitions plus MessagePack encoders/decoders
     for a given type.
 
@@ -696,6 +811,14 @@ def codec(type: Any) -> str:
     ----------
     type : type
         The type to generate a codec for.
+    tensor_encoder : str, optional
+        The name of a TypeScript function ``(value) => TensorHandle`` to call
+        when encoding a tensor. Required if ``type`` contains any tensor types.
+    tensor_decoder : str, optional
+        The name of a TypeScript function ``(handle: TensorHandle) => value`` to
+        call when decoding a tensor. Required if ``type`` contains any tensor
+        types. Both functions are assumed to be in scope in the emitted module;
+        a ``TensorHandle`` class and the ext-84 ``ExtensionCodec`` are generated.
 
     Returns
     -------
@@ -711,13 +834,23 @@ def codec(type: Any) -> str:
     component_types = _collect_component_types(type_infos)
     name_map = _build_name_map(component_types)
 
-    schema_gen = _SchemaGenerator(name_map)
-    codec_gen = _CodecGenerator(name_map)
+    has_tensor = _contains_tensor(root)
+    if has_tensor and (tensor_encoder is None or tensor_decoder is None):
+        raise TypeError(
+            "codec() requires both `tensor_encoder` and `tensor_decoder` when "
+            "the type contains tensor types"
+        )
 
-    parts = [
-        'import { encode as _mpEncode, decode as _mpDecode } '
-        'from "@msgpack/msgpack";'
-    ]
+    schema_gen = _SchemaGenerator(name_map)
+    codec_gen = _CodecGenerator(name_map, tensor_encoder, tensor_decoder)
+
+    imports = "encode as _mpEncode, decode as _mpDecode"
+    if has_tensor:
+        imports += ", ExtensionCodec"
+    parts = [f'import {{ {imports} }} from "@msgpack/msgpack";']
+
+    if has_tensor:
+        parts.append(_TENSOR_RUNTIME)
 
     # Type definitions (same as `schema`).
     for cls, t in component_types.items():
@@ -735,13 +868,15 @@ def codec(type: Any) -> str:
             parts.append(codec_gen.dec_def(name_map[cls], t))
 
     # Top-level entry points.
+    opts = ", _codecOptions" if has_tensor else ""
+    decode_call = f"_mpDecode(bytes{opts})"
     parts.append(
         f"export function encode(value: {root_ref}): Uint8Array {{\n"
-        f"{_INDENT}return _mpEncode({codec_gen.enc(root, 'value')});\n}}"
+        f"{_INDENT}return _mpEncode({codec_gen.enc(root, 'value')}{opts});\n}}"
     )
     parts.append(
         f"export function decode(bytes: Uint8Array): {root_ref} {{\n"
-        f"{_INDENT}return {codec_gen.dec(root, '_mpDecode(bytes)')} as {root_ref};\n}}"
+        f"{_INDENT}return {codec_gen.dec(root, decode_call)} as {root_ref};\n}}"
     )
 
     return "\n\n".join(parts) + "\n"

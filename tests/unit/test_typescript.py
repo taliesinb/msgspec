@@ -296,6 +296,57 @@ class TestCodec:
         assert 'c: value["c"],' in out
         assert 'c: (o["c"] as Color),' in out
 
+    def test_no_tensor_runtime_when_absent(self):
+        class P(Struct):
+            x: int
+
+        out = cc(P)
+        assert "TensorHandle" not in out
+        assert "ExtensionCodec" not in out
+        assert "_codecOptions" not in out
+
+
+class TestCodecTensor:
+    def _layer(self):
+        from msgspec.data import Float32, Tensor
+
+        class Layer(Struct):
+            name: str
+            weights: Tensor[1, Float32]
+
+        return Layer
+
+    def test_requires_hooks(self):
+        Layer = self._layer()
+        with pytest.raises(TypeError, match="tensor_encoder"):
+            msgspec.typescript.codec(Layer)
+        with pytest.raises(TypeError, match="tensor_decoder"):
+            msgspec.typescript.codec(Layer, tensor_encoder="wrap")
+
+    def test_emits_runtime_and_hooks(self):
+        Layer = self._layer()
+        out = msgspec.typescript.codec(
+            Layer, tensor_encoder="wrapT", tensor_decoder="unwrapT"
+        )
+        # import + runtime
+        assert "ExtensionCodec" in out
+        assert "export class TensorHandle {" in out
+        assert "data: Uint8Array;" in out
+        assert "type: _TENSOR_EXT_TYPE," in out
+        # hooks called at the tensor position
+        assert 'weights: wrapT(value["weights"]),' in out
+        assert 'weights: unwrapT(o["weights"] as TensorHandle),' in out
+        # options threaded to encode/decode
+        assert "_mpEncode(encodeLayer(value), _codecOptions)" in out
+        assert "_mpDecode(bytes, _codecOptions)" in out
+
+    def test_tensor_ext_code_84(self):
+        Layer = self._layer()
+        out = msgspec.typescript.codec(
+            Layer, tensor_encoder="wrapT", tensor_decoder="unwrapT"
+        )
+        assert "const _TENSOR_EXT_TYPE = 84;" in out
+
 
 def test_newtype_alias_emitted_as_type():
     Pixels = NewType("Pixels", int)
