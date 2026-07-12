@@ -55,6 +55,7 @@ __all__ = (
     "EnumType",
     "LiteralType",
     "CustomType",
+    "AliasType",
     "UnionType",
     "CollectionType",
     "ListType",
@@ -327,6 +328,26 @@ class CustomType(Type):
     cls: type
 
 
+class AliasType(Type):
+    """A type corresponding to a named type alias.
+
+    This wraps the underlying type of a `typing.NewType` or a :pep:`695`
+    ``type X = ...`` alias, preserving the alias' name. These are only emitted
+    when `type_info`/`multi_type_info` is called with ``aliases=True``;
+    otherwise aliases are transparently resolved to their underlying type.
+
+    Parameters
+    ----------
+    name: str
+        The alias name (e.g. ``"Pixels"``).
+    value: Type
+        The resolved underlying type.
+    """
+
+    name: str
+    value: Type
+
+
 class UnionType(Type):
     """A union type.
 
@@ -596,13 +617,20 @@ class StructType(Type):
     forbid_unknown_fields: bool = False
 
 
-def multi_type_info(types: Iterable[Any]) -> tuple[Type, ...]:
+def multi_type_info(
+    types: Iterable[Any], *, aliases: bool = False
+) -> tuple[Type, ...]:
     """Get information about multiple msgspec-compatible types.
 
     Parameters
     ----------
     types: an iterable of types
         The types to get info about.
+    aliases: bool, optional
+        If ``True``, named type aliases (a `typing.NewType` or a :pep:`695`
+        ``type X = ...`` alias) are preserved as `AliasType` nodes wrapping
+        their underlying type. If ``False`` (the default) aliases are
+        transparently resolved to their underlying type.
 
     Returns
     -------
@@ -616,10 +644,10 @@ def multi_type_info(types: Iterable[Any]) -> tuple[Type, ...]:
      ListType(item_type=StrType(min_length=None, max_length=None, pattern=None),
               min_length=None, max_length=None))
     """
-    return _Translator(types).run()
+    return _Translator(types, aliases=aliases).run()
 
 
-def type_info(type: Any) -> Type:
+def type_info(type: Any, *, aliases: bool = False) -> Type:
     """Get information about a msgspec-compatible type.
 
     Note that if you need to inspect multiple types it's more efficient to call
@@ -630,6 +658,11 @@ def type_info(type: Any) -> Type:
     ----------
     type: type
         The type to get info about.
+    aliases: bool, optional
+        If ``True``, named type aliases (a `typing.NewType` or a :pep:`695`
+        ``type X = ...`` alias) are preserved as `AliasType` nodes wrapping
+        their underlying type. If ``False`` (the default) aliases are
+        transparently resolved to their underlying type.
 
     Returns
     -------
@@ -647,7 +680,7 @@ def type_info(type: Any) -> Type:
     ListType(item_type=IntType(gt=None, ge=None, lt=None, le=None, multiple_of=None),
              min_length=None, max_length=None)
     """
-    return multi_type_info([type])[0]
+    return multi_type_info([type], aliases=aliases)[0]
 
 
 # Implementation details
@@ -752,9 +785,33 @@ def _merge_json(a, b):
     return a
 
 
+def _alias_info(typ):
+    """If ``typ`` is a named type alias, return ``(name, underlying)``, else
+    ``None``.
+
+    Handles `typing.NewType` and :pep:`695` ``type X = ...`` aliases (both bare
+    and subscripted generic aliases like ``Vec[int]``). ``Annotated[...]`` is
+    intentionally not treated as an alias here - its metadata handling is left
+    to ``_origin_args_metadata``, which transparently resolves any alias it
+    wraps.
+    """
+    if type(typ) is _AnnotatedAlias:
+        return None
+    if type(typ) is _TypeAliasType:
+        return typ.__name__, typ.__value__
+    supertype = getattr(typ, "__supertype__", None)
+    if supertype is not None:
+        return typ.__name__, supertype
+    origin = getattr(typ, "__origin__", None)
+    if type(origin) is _TypeAliasType:
+        return origin.__name__, origin.__value__[typ.__args__]
+    return None
+
+
 class _Translator:
-    def __init__(self, types):
+    def __init__(self, types, aliases=False):
         self.types = tuple(types)
+        self.aliases = aliases
         self.type_hints = {}
         self.cache = {}
 
@@ -774,6 +831,23 @@ class _Translator:
         return tuple(self.translate(t) for t in self.types)
 
     def translate(self, typ):
+        if self.aliases:
+            try:
+                alias = _alias_info(typ)
+            except TypeError:
+                # typ is unhashable or otherwise not alias-like
+                alias = None
+            if alias is not None:
+                if typ in self.cache:
+                    return self.cache[typ]
+                name, value = alias
+                # Seed the cache with a placeholder before recursing so that
+                # self-referential aliases (e.g. `type JSON = int | list[JSON]`)
+                # terminate.
+                self.cache[typ] = out = AliasType(name, AnyType())
+                out.value = self.translate(value)
+                return out
+
         t, args, metadata = _origin_args_metadata(typ)
 
         # Extract and merge components of any `Meta` annotations

@@ -1,11 +1,13 @@
 import datetime
 import enum
+import sys
 import uuid
 from typing import (
     Any,
     Dict,
     List,
     Literal,
+    NewType,
     Optional,
     Set,
     Tuple,
@@ -16,6 +18,10 @@ import pytest
 
 import msgspec
 from msgspec import Struct
+
+py312_plus = pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="3.12+ only"
+)
 
 
 def ts(type):
@@ -174,3 +180,72 @@ def test_custom_type_raises():
 def test_ext_type_raises():
     with pytest.raises(TypeError, match="Ext"):
         ts(msgspec.msgpack.Ext)
+
+
+def test_newtype_alias_emitted_as_type():
+    Pixels = NewType("Pixels", int)
+
+    class Sprite(Struct):
+        width: Pixels
+        height: Pixels
+
+    out = ts(Sprite)
+    assert "export type Pixels = number;" in out
+    assert "  width: Pixels;" in out
+    assert "  height: Pixels;" in out
+    # A single alias definition, even though referenced twice.
+    assert out.count("export type Pixels = number;") == 1
+
+
+def test_alias_of_str():
+    UserId = NewType("UserId", str)
+
+    class User(Struct):
+        id: UserId
+
+    out = ts(User)
+    assert "export type UserId = string;" in out
+    assert "  id: UserId;" in out
+
+
+def test_alias_of_list():
+    Row = NewType("Row", List[int])
+
+    class Grid(Struct):
+        rows: List[Row]
+
+    out = ts(Grid)
+    assert "export type Row = Array<number>;" in out
+    assert "  rows: Array<Row>;" in out
+
+
+def test_alias_as_root():
+    Pixels = NewType("Pixels", int)
+    out = ts(List[Pixels])
+    assert "export type Pixels = number;" in out
+    assert "export type Root = Array<Pixels>;" in out
+
+
+def test_alias_referencing_struct():
+    class Point(Struct):
+        x: int
+
+    Ref = NewType("Ref", Point)
+
+    class Holder(Struct):
+        p: Ref
+
+    out = ts(Holder)
+    assert "export type Ref = Point;" in out
+    assert "export class Point {" in out
+    assert "  p: Ref;" in out
+
+
+@py312_plus
+def test_pep695_type_alias():
+    from .utils import temp_module
+
+    with temp_module("type Pixels = int") as mod:
+        out = ts(List[mod.Pixels])
+    assert "export type Pixels = number;" in out
+    assert "export type Root = Array<Pixels>;" in out

@@ -71,11 +71,13 @@ def schema_components(
     --------
     schema
     """
-    type_infos = mi.multi_type_info(types)
+    # `aliases=True` so `type Pixels = int` is preserved as an `AliasType` and
+    # emitted as a TypeScript `type` alias rather than being inlined.
+    type_infos = mi.multi_type_info(types, aliases=True)
 
-    component_types = _collect_component_types(type_infos)
+    cls_components, alias_components = _collect_component_types(type_infos)
 
-    name_map = _build_name_map(component_types)
+    name_map = _build_name_map(cls_components)
 
     gen = _SchemaGenerator(name_map)
 
@@ -83,26 +85,41 @@ def schema_components(
 
     components = {
         name_map[cls]: gen.to_def(name_map[cls], t)
-        for cls, t in component_types.items()
+        for cls, t in cls_components.items()
     }
+    for name, t in alias_components.items():
+        components[name] = gen.to_def(name, t)
     return refs, components
 
 
-def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type]:
+def _collect_component_types(
+    type_infos: Iterable[mi.Type],
+) -> tuple[dict[Any, mi.Type], dict[str, mi.AliasType]]:
     """Find all "nameable" types in the type tree worthy of a top-level
-    definition (Struct, Dataclass, NamedTuple, TypedDict, and Enum types)."""
-    components: dict[Any, mi.Type] = {}
+    definition.
+
+    Returns a ``(cls_components, alias_components)`` pair: the first maps a
+    class (Struct, Dataclass, NamedTuple, TypedDict, or Enum) to its Type, the
+    second maps an alias name to its `AliasType`.
+    """
+    cls_components: dict[Any, mi.Type] = {}
+    alias_components: dict[str, mi.AliasType] = {}
 
     def collect(t):
-        if isinstance(
+        if isinstance(t, mi.AliasType):
+            name = _ts_ident(t.name)
+            if name not in alias_components:
+                alias_components[name] = t
+                collect(t.value)
+        elif isinstance(
             t, (mi.StructType, mi.TypedDictType, mi.DataclassType, mi.NamedTupleType)
         ):
-            if t.cls not in components:
-                components[t.cls] = t
+            if t.cls not in cls_components:
+                cls_components[t.cls] = t
                 for f in t.fields:
                     collect(f.type)
         elif isinstance(t, mi.EnumType):
-            components[t.cls] = t
+            cls_components[t.cls] = t
         elif isinstance(t, mi.Metadata):
             collect(t.type)
         elif isinstance(t, mi.CollectionType):
@@ -120,7 +137,7 @@ def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type
     for t in type_infos:
         collect(t)
 
-    return components
+    return cls_components, alias_components
 
 
 def _type_repr(obj):
@@ -180,6 +197,14 @@ def _build_name_map(component_types: dict[Any, mi.Type]) -> dict[Any, str]:
     return {v: k for k, v in names.items()}
 
 
+def _ts_ident(name: str) -> str:
+    """Normalize an arbitrary name to a valid TypeScript identifier."""
+    name = re.sub(r"[^a-zA-Z0-9_$]", "_", name)
+    if name and name[0].isdigit():
+        name = "_" + name
+    return name or "_"
+
+
 def _prop_name(name: str) -> str:
     """Render a property name, quoting it if it's not a valid identifier."""
     if _IDENT_RE.match(name):
@@ -215,6 +240,10 @@ class _SchemaGenerator:
         """Render a Type as an inline TypeScript type reference."""
         while isinstance(t, mi.Metadata):
             t = t.type
+
+        # Aliases are referenced by their (normalized) name.
+        if isinstance(t, mi.AliasType):
+            return _ts_ident(t.name)
 
         # Nameable components are referenced by name.
         if hasattr(t, "cls"):
@@ -277,7 +306,9 @@ class _SchemaGenerator:
 
     def to_def(self, name: str, t: mi.Type) -> str:
         """Render a nameable Type as a top-level TypeScript definition."""
-        if isinstance(t, mi.EnumType):
+        if isinstance(t, mi.AliasType):
+            return f"export type {name} = {self.to_ref(t.value)};"
+        elif isinstance(t, mi.EnumType):
             return self._enum_def(name, t)
         elif isinstance(t, mi.StructType) and t.array_like:
             return self._array_struct_def(name, t)
