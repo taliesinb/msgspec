@@ -327,6 +327,33 @@ class TestCodec:
         assert '    type: "rec",' in out
         assert "a: (a[1] as number)," in out
 
+    def test_bigint_scalar_conversion(self):
+        from msgspec.data import Float, Int
+
+        class Foo(Struct):
+            a: int  # plain int -> number, identity
+            b: Int  # -> bigint, converted
+            c: Float  # -> number, identity
+
+        out = cc(Foo)
+        assert 'a: value["a"],' in out
+        assert 'b: Number(value["b"]),' in out  # encode: bigint -> number
+        assert 'c: value["c"],' in out
+        assert 'a: (o["a"] as number),' in out
+        assert 'b: BigInt(o["b"] as number),' in out  # decode: number -> bigint
+        assert 'c: (o["c"] as number),' in out
+
+    def test_int64_uint64_also_converted(self):
+        from msgspec.data import Int64, UInt64
+
+        class Foo(Struct):
+            a: Int64
+            b: UInt64
+
+        out = cc(Foo)
+        assert "Number(value[" in out
+        assert "BigInt(o[" in out
+
     def test_enum_and_alias_identity(self):
         import enum
 

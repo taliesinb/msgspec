@@ -304,10 +304,7 @@ class _SchemaGenerator:
                 key = "string"
             return f"Record<{key}, {self.to_ref(t.value_type)}>"
         elif isinstance(t, mi.ScalarType):
-            # A `msgspec.data` scalar; dtype `None` (`Scalar`) is any scalar.
-            if t.dtype is None:
-                return "number | boolean"
-            return _DTYPE_TS_SCALAR[t.dtype]
+            return _scalar_ts(t)
         elif isinstance(t, mi.TensorType):
             # A packed tensor -> a typed array, dispatched on dtype. TypeScript
             # can't express rank/shape, so ndims/sizes are dropped. dtype `None`
@@ -397,8 +394,15 @@ _SCALAR_IDENTITY = (
     mi.DecimalType,
     mi.EnumType,
     mi.LiteralType,
-    mi.ScalarType,
 )
+
+
+def _scalar_ts(t: mi.ScalarType) -> str:
+    """The TypeScript type for a `msgspec.data` scalar. dtype `None` (`Scalar`)
+    is any scalar; 64-bit integer dtypes map to `bigint`."""
+    if t.dtype is None:
+        return "number | boolean"
+    return _DTYPE_TS_SCALAR[t.dtype]
 
 # Object/tuple-like components that get a generated encode/decode function pair.
 _CODEC_FUNC_TYPES = (
@@ -416,6 +420,10 @@ def _is_identity(t: mi.Type) -> bool:
         t = t.type
     if isinstance(t, _SCALAR_IDENTITY):
         return True
+    if isinstance(t, mi.ScalarType):
+        # `bigint` scalars (int64/uint64) need a `BigInt(...)` / `Number(...)`
+        # conversion; `number`/`boolean` scalars pass through.
+        return _scalar_ts(t) != "bigint"
     if isinstance(t, (mi.ListType, mi.VarTupleType)):
         return _is_identity(t.item_type)
     if isinstance(t, mi.TupleType):
@@ -468,6 +476,10 @@ class _CodecGenerator:
                     "codec() requires `tensor_encoder` to encode tensor types"
                 )
             return f"{self.tensor_encoder}({expr})"
+        if isinstance(t, mi.ScalarType):
+            # a `bigint` scalar; @msgpack/msgpack can't encode bigint, so narrow
+            # back to a number for the wire.
+            return f"Number({expr})"
         if isinstance(t, _CODEC_FUNC_TYPES):
             return f"encode{self.name_map[t.cls]}({expr})"
         if isinstance(t, mi.AliasType):
@@ -504,6 +516,10 @@ class _CodecGenerator:
                     "codec() requires `tensor_decoder` to decode tensor types"
                 )
             return f"{self.tensor_decoder}({expr} as TensorHandle)"
+        if isinstance(t, mi.ScalarType):
+            # a `bigint` scalar; the wire value is a number, so convert it into a
+            # real bigint (a bare `as bigint` cast would leave a number behind).
+            return f"BigInt({expr} as number)"
         if isinstance(t, _CODEC_FUNC_TYPES):
             return f"decode{self.name_map[t.cls]}({expr})"
         if isinstance(t, mi.AliasType):

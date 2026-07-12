@@ -28,9 +28,17 @@ constructor for annotating fields:
 
 The available dtype aliases are ``UInt8``, ``UInt16``, ``UInt32``, ``UInt64``,
 ``Int8``, ``Int16``, ``Int32``, ``Int64``, ``Float32``, ``Float64``, and
-``Bool``. ``Tensor[shape, dtype]`` takes a shape (an ``int`` number of axes, a
-tuple of sizes, or ``None``) and a dtype (one of the aliases, or ``None`` for
-any).
+``Bool``, plus the generic markers ``Int`` (an integer, dtype ``int64``) and
+``Float`` (dtype ``float64``). ``Tensor[shape, dtype]`` takes a shape (an
+``int`` number of axes, a tuple of sizes, or ``None``) and a dtype (one of the
+aliases, or ``None`` for any).
+
+``Int`` and ``Float`` are also useful as *ordinary* field annotations: unlike
+plain ``int``/``float`` (both ``number`` in TypeScript), ``Int`` maps to
+TypeScript ``bigint`` - preserving the integer/float distinction into JS. The
+:doc:`codec <typescript>` converts these soundly (``BigInt(...)`` on decode,
+``Number(...)`` on encode); values above ``2**53`` are subject to JS number
+precision.
 
 These are ordinary :doc:`inspectable <inspect>` types. ``msgspec.inspect``
 reports them as ``ScalarType`` / ``TensorType`` nodes:

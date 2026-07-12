@@ -37,6 +37,8 @@ from ._utils import (  # type: ignore
 from .data import (
     DTYPE_ALIASES,
     DType,
+    Float,
+    Int,
     Scalar,
     TensorMeta as _TensorMeta,
     parse_dtype as _parse_dtype,
@@ -45,9 +47,12 @@ from .data import (
 # Precomputed map from each `msgspec.data` scalar alias to its dtype string
 # (or None for the dtype-agnostic `Scalar`). Membership is used as a cheap
 # fast-path gate in `_Translator.translate`; the values give the `ScalarType`
-# dtype without re-parsing.
+# dtype without re-parsing. `Int`/`Float` are the generic "keep it an integer /
+# float" markers, mapped to int64 / float64.
 _SCALAR_ALIASES: dict[Any, DType | None] = {a: _parse_dtype(a) for a in DTYPE_ALIASES}
 _SCALAR_ALIASES[Scalar] = None
+_SCALAR_ALIASES[Int] = _parse_dtype(Int)
+_SCALAR_ALIASES[Float] = _parse_dtype(Float)
 
 __all__ = (
     "type_info",

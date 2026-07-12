@@ -296,6 +296,20 @@ def test_data_scalar_aliases():
         assert mi.type_info(alias) == mi.ScalarType(dtype=name)
     # The dtype-agnostic `Scalar` resolves to ScalarType(None).
     assert mi.type_info(md.Scalar) == mi.ScalarType(dtype=None)
+    # `Int`/`Float` are the generic markers -> int64 / float64.
+    assert mi.type_info(md.Int) == mi.ScalarType(dtype="int64")
+    assert mi.type_info(md.Float) == mi.ScalarType(dtype="float64")
+
+
+def test_data_int_float_in_tensors():
+    from msgspec import data as md
+
+    assert mi.type_info(md.Tensor[3, md.Int]) == mi.TensorType(
+        ndims=3, sizes=None, dtype="int64"
+    )
+    assert mi.type_info(md.Tensor[(2, 2), md.Float]) == mi.TensorType(
+        ndims=2, sizes=(2, 2), dtype="float64"
+    )
 
 
 def test_data_scalar_alias_recognized_regardless_of_aliases_flag():

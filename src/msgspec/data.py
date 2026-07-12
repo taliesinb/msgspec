@@ -8,6 +8,8 @@ except ImportError:  # pragma: no cover - Python < 3.12
     from typing_extensions import TypeAliasType
 
 __all__ = [  # noqa: F822  (TensorHandle is provided via module __getattr__)
+    'Int',
+    'Float',
     'UInt8',
     'UInt16',
     'UInt32',
@@ -24,6 +26,9 @@ __all__ = [  # noqa: F822  (TensorHandle is provided via module __getattr__)
     'Tensor',
     'TensorHandle',
 ]
+
+Int = TypeAliasType("Int", int)      # treated as Int64 in arrays, and bigint in ordinary annotations
+Float = TypeAliasType("Float", float)  # treated as Float64 in arrays, and number in ordinary annotations
 
 # `X = TypeAliasType("X", value)` is the back-compatible spelling of the PEP 695
 # `type X = value` statement (which is 3.12+ syntax). Each of these turns into a
@@ -102,8 +107,11 @@ def parse_dtype(dtype: type | TypeAliasType | None) -> DType | None:
         return None
     if isinstance(dtype, TypeAliasType):
         name = dtype.__name__.lower()
-        assert name in DTYPE_STRINGS
-        return name
+        if name in DTYPE_STRINGS:
+            return name
+        # `Int`/`Float` (and any other alias not itself a dtype) resolve via
+        # their underlying type: `Int` -> int64, `Float` -> float64.
+        dtype = dtype.__value__
     if dtype is float:
         return 'float64'
     if dtype is int:
