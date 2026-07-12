@@ -1,6 +1,8 @@
 from typing import Any, Literal, TypeAlias, overload
 
 __all__ = [
+    'Int',
+    'Float',
     'UInt8',
     'UInt16',
     'UInt32',
@@ -22,6 +24,10 @@ __all__ = [
 # read a dtype name off each and tell them apart). Type checkers only need to
 # know the underlying type they stand for, which the classic PEP 613 spelling
 # conveys portably.
+
+Int:  TypeAlias = int
+Float: TypeAlias = float
+
 UInt8: TypeAlias = int
 UInt16: TypeAlias = int
 UInt32: TypeAlias = int
