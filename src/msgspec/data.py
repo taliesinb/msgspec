@@ -159,12 +159,21 @@ class Tensor(metaclass=TensorMeta):
 # re-exported here lazily via `__getattr__` so that `_core` can import this
 # module during its own initialization without a circular import.
 #
-# Milestone 2 (not yet implemented):
-# - JSON encoding as a struct {'shape': ..., 'dtype': ..., 'data': base64}.
-# - a `dec_tensor` hook: a function taking (shape, dtype, data: bytes) that
-#   returns the caller's preferred tensor type (e.g. a numpy array).
-# - automatically recognizing numpy arrays and wrapping them as TensorHandle,
-#   without introducing a dependency on numpy.
+def _numpy_to_tensor_handle(arr):
+    # Wrap a numpy array as a `TensorHandle`. Called from the C encoder when it
+    # encounters a numpy array (numpy is never imported by msgspec itself - if
+    # `arr` exists then numpy is already imported, so this is dependency-free).
+    from ._core import TensorHandle
+
+    dtype = arr.dtype
+    name = dtype.name
+    if name not in DTYPE_STRINGS:
+        raise TypeError(f"Cannot encode numpy array with unsupported dtype {name!r}")
+    # msgpack packs the raw buffer, so it must be C-contiguous and native-endian.
+    if dtype.byteorder not in ('=', '|') or not arr.flags['C_CONTIGUOUS']:
+        arr = arr.astype(dtype.newbyteorder('='), order='C', copy=False)
+        arr = arr if arr.flags['C_CONTIGUOUS'] else arr.copy(order='C')
+    return TensorHandle(arr, dtype=name, shape=tuple(arr.shape))
 
 
 def __getattr__(name):

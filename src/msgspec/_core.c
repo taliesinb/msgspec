@@ -494,6 +494,7 @@ typedef struct {
     PyObject *str_enc_hook;
     PyObject *str_dec_hook;
     PyObject *str_ext_hook;
+    PyObject *str_dec_tensor;
     PyObject *str_strict;
     PyObject *str_order;
     PyObject *str_utcoffset;
@@ -544,6 +545,9 @@ typedef struct {
     PyObject *TensorMeta;       /* the metaclass of `Tensor` / `Tensor[...]` */
     PyObject *Tensor;           /* the base `Tensor` class */
     PyObject *dtype_strings;    /* tuple of dtype name strings, index == dtype code */
+    PyObject *numpy_to_handle;  /* data._numpy_to_tensor_handle */
+    PyObject *numpy_ndarray;    /* numpy.ndarray, resolved lazily (NULL if numpy absent) */
+    PyObject *str_numpy;        /* the string "numpy" */
     uint8_t gc_cycle;
 } MsgspecState;
 
@@ -13543,6 +13547,25 @@ mpack_encode_struct(EncoderState *self, PyObject *obj)
 #define MS_EXT_TENSOR_CODE 84  /* ASCII 'T' */
 #define MS_TENSOR_VERSION 1
 
+/* Return `numpy.ndarray` if numpy is already imported, else NULL (without
+ * importing it - if the value being encoded is a numpy array then numpy is
+ * necessarily already imported). The result is cached on the module state. */
+static PyTypeObject *
+ms_numpy_ndarray(MsgspecState *mod) {
+    if (mod->numpy_ndarray == NULL) {
+        PyObject *numpy = PyImport_GetModule(mod->str_numpy);
+        if (numpy == NULL) return NULL;  /* numpy not imported */
+        PyObject *nd = PyObject_GetAttrString(numpy, "ndarray");
+        Py_DECREF(numpy);
+        if (nd == NULL) {
+            PyErr_Clear();
+            return NULL;
+        }
+        mod->numpy_ndarray = nd;  /* keep the reference */
+    }
+    return (PyTypeObject *)mod->numpy_ndarray;
+}
+
 /* Map a dtype str (or None) to its wire code: 0..N-1, 255 for None, or -1 with
  * an exception set if unrecognized. */
 static int
@@ -13939,6 +13962,16 @@ mpack_encode_uncommon(EncoderState *self, PyTypeObject *type, PyObject *obj)
         if (PyDict_Contains(type->tp_dict, self->mod->str___attrs_attrs__)) {
             return mpack_encode_object(self, obj);
         }
+    }
+
+    /* Automatically wrap numpy arrays as tensors. */
+    PyTypeObject *ndarray = ms_numpy_ndarray(self->mod);
+    if (ndarray != NULL && PyObject_TypeCheck(obj, ndarray)) {
+        PyObject *handle = PyObject_CallOneArg(self->mod->numpy_to_handle, obj);
+        if (handle == NULL) return -1;
+        int status = mpack_encode_tensorhandle(self, handle);
+        Py_DECREF(handle);
+        return status;
     }
 
     if (self->enc_hook != NULL) {
@@ -15289,6 +15322,7 @@ typedef struct DecoderState {
     TypeNode *type;
     PyObject *dec_hook;
     PyObject *ext_hook;
+    PyObject *dec_tensor;
     bool strict;
 
     /* Per-message attributes */
@@ -15307,6 +15341,7 @@ typedef struct Decoder {
     char strict;
     PyObject *dec_hook;
     PyObject *ext_hook;
+    PyObject *dec_tensor;
 } Decoder;
 
 PyDoc_STRVAR(Decoder__doc__,
@@ -15344,15 +15379,16 @@ PyDoc_STRVAR(Decoder__doc__,
 static int
 Decoder_init(Decoder *self, PyObject *args, PyObject *kwds)
 {
-    char *kwlist[] = {"type", "strict", "dec_hook", "ext_hook", NULL};
+    char *kwlist[] = {"type", "strict", "dec_hook", "ext_hook", "dec_tensor", NULL};
     MsgspecState *st = msgspec_get_global_state();
     PyObject *type = st->typing_any;
     PyObject *ext_hook = NULL;
     PyObject *dec_hook = NULL;
+    PyObject *dec_tensor = NULL;
     int strict = 1;
 
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwds, "|O$pOO", kwlist, &type, &strict, &dec_hook, &ext_hook
+            args, kwds, "|O$pOOO", kwlist, &type, &strict, &dec_hook, &ext_hook, &dec_tensor
         )) {
         return -1;
     }
@@ -15386,6 +15422,19 @@ Decoder_init(Decoder *self, PyObject *args, PyObject *kwds)
     }
     self->ext_hook = ext_hook;
 
+    /* Handle dec_tensor */
+    if (dec_tensor == Py_None) {
+        dec_tensor = NULL;
+    }
+    if (dec_tensor != NULL) {
+        if (!PyCallable_Check(dec_tensor)) {
+            PyErr_SetString(PyExc_TypeError, "dec_tensor must be callable");
+            return -1;
+        }
+        Py_INCREF(dec_tensor);
+    }
+    self->dec_tensor = dec_tensor;
+
     /* Handle type */
     self->type = TypeNode_Convert(type);
     if (self->type == NULL) {
@@ -15404,6 +15453,7 @@ Decoder_traverse(Decoder *self, visitproc visit, void *arg)
     Py_VISIT(self->orig_type);
     Py_VISIT(self->dec_hook);
     Py_VISIT(self->ext_hook);
+    Py_VISIT(self->dec_tensor);
     return 0;
 }
 
@@ -15415,6 +15465,7 @@ Decoder_dealloc(Decoder *self)
     Py_XDECREF(self->orig_type);
     Py_XDECREF(self->dec_hook);
     Py_XDECREF(self->ext_hook);
+    Py_XDECREF(self->dec_tensor);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -16785,7 +16836,7 @@ mpack_decode_map(
  * bytes object that `native` (a memoryview) then views. */
 static PyObject *
 mpack_decode_tensorhandle(
-    char *data_buf, Py_ssize_t size, PathNode *path
+    DecoderState *self, char *data_buf, Py_ssize_t size, PathNode *path
 ) {
     MsgspecState *mod = msgspec_get_global_state();
     PyObject *dtype = NULL, *shape = NULL, *raw = NULL, *native = NULL, *out = NULL;
@@ -16836,13 +16887,22 @@ mpack_decode_tensorhandle(
         goto done;
     }
 
-    /* native = memoryview(bytes(raw payload)) */
+    /* raw payload bytes */
     raw = PyBytes_FromStringAndSize(data_buf + off, size - off);
     if (raw == NULL) goto done;
-    native = PyMemoryView_FromObject(raw);
-    if (native == NULL) goto done;
 
-    out = TensorHandle_New(native, dtype, shape);
+    if (self->dec_tensor != NULL) {
+        /* dec_tensor(shape, dtype, data: bytes) -> the caller's tensor type */
+        out = PyObject_CallFunctionObjArgs(
+            self->dec_tensor, shape, dtype, raw, NULL
+        );
+    }
+    else {
+        /* native = memoryview(bytes(raw payload)) */
+        native = PyMemoryView_FromObject(raw);
+        if (native == NULL) goto done;
+        out = TensorHandle_New(native, dtype, shape);
+    }
 
 done:
     Py_XDECREF(dtype);
@@ -16867,7 +16927,7 @@ mpack_decode_ext(
     if (mpack_read(self, &data_buf, size) < 0) return NULL;
 
     if (code == MS_EXT_TENSOR_CODE && (type->types & (MS_TYPE_TENSOR | MS_TYPE_ANY))) {
-        return mpack_decode_tensorhandle(data_buf, size, path);
+        return mpack_decode_tensorhandle(self, data_buf, size, path);
     }
     else if (type->types & MS_TYPE_DATETIME && code == -1) {
         return mpack_decode_datetime(self, data_buf, size, type, path);
@@ -17105,7 +17165,8 @@ Decoder_decode(Decoder *self, PyObject *const *args, Py_ssize_t nargs)
         .type = self->type,
         .strict = self->strict,
         .dec_hook = self->dec_hook,
-        .ext_hook = self->ext_hook
+        .ext_hook = self->ext_hook,
+        .dec_tensor = self->dec_tensor
     };
 
     Py_buffer buffer;
@@ -17142,6 +17203,7 @@ static PyMemberDef Decoder_members[] = {
     {"strict", T_BOOL, offsetof(Decoder, strict), READONLY, "The Decoder strict setting"},
     {"dec_hook", T_OBJECT, offsetof(Decoder, dec_hook), READONLY, "The Decoder dec_hook"},
     {"ext_hook", T_OBJECT, offsetof(Decoder, ext_hook), READONLY, "The Decoder ext_hook"},
+    {"dec_tensor", T_OBJECT, offsetof(Decoder, dec_tensor), READONLY, "The Decoder dec_tensor"},
     {NULL},
 };
 
@@ -17208,7 +17270,7 @@ static PyObject*
 msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
 {
     PyObject *res = NULL, *buf = NULL, *type = NULL, *strict_obj = NULL;
-    PyObject *dec_hook = NULL, *ext_hook = NULL;
+    PyObject *dec_hook = NULL, *ext_hook = NULL, *dec_tensor = NULL;
     MsgspecState *mod = msgspec_get_state(self);
     int strict = 1;
 
@@ -17221,6 +17283,7 @@ msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
         if ((strict_obj = find_keyword(kwnames, args + nargs, mod->str_strict)) != NULL) nkwargs--;
         if ((dec_hook = find_keyword(kwnames, args + nargs, mod->str_dec_hook)) != NULL) nkwargs--;
         if ((ext_hook = find_keyword(kwnames, args + nargs, mod->str_ext_hook)) != NULL) nkwargs--;
+        if ((dec_tensor = find_keyword(kwnames, args + nargs, mod->str_dec_tensor)) != NULL) nkwargs--;
         if (nkwargs > 0) {
             PyErr_SetString(
                 PyExc_TypeError,
@@ -17258,10 +17321,22 @@ msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
         }
     }
 
+    /* Handle dec_tensor */
+    if (dec_tensor == Py_None) {
+        dec_tensor = NULL;
+    }
+    if (dec_tensor != NULL) {
+        if (!PyCallable_Check(dec_tensor)) {
+            PyErr_SetString(PyExc_TypeError, "dec_tensor must be callable");
+            return NULL;
+        }
+    }
+
     DecoderState state = {
         .strict = strict,
         .dec_hook = dec_hook,
-        .ext_hook = ext_hook
+        .ext_hook = ext_hook,
+        .dec_tensor = dec_tensor
     };
 
     /* Allocate Any & Struct type nodes (simple, common cases) on the stack,
@@ -22976,6 +23051,7 @@ msgspec_clear(PyObject *m)
     Py_CLEAR(st->str_enc_hook);
     Py_CLEAR(st->str_dec_hook);
     Py_CLEAR(st->str_ext_hook);
+    Py_CLEAR(st->str_dec_tensor);
     Py_CLEAR(st->str_strict);
     Py_CLEAR(st->str_order);
     Py_CLEAR(st->str_utcoffset);
@@ -23025,6 +23101,9 @@ msgspec_clear(PyObject *m)
     Py_CLEAR(st->TensorMeta);
     Py_CLEAR(st->Tensor);
     Py_CLEAR(st->dtype_strings);
+    Py_CLEAR(st->numpy_to_handle);
+    Py_CLEAR(st->numpy_ndarray);
+    Py_CLEAR(st->str_numpy);
     return 0;
 }
 
@@ -23105,6 +23184,9 @@ msgspec_traverse(PyObject *m, visitproc visit, void *arg)
     Py_VISIT(st->TensorMeta);
     Py_VISIT(st->Tensor);
     Py_VISIT(st->dtype_strings);
+    Py_VISIT(st->numpy_to_handle);
+    Py_VISIT(st->numpy_ndarray);
+    Py_VISIT(st->str_numpy);
     return 0;
 }
 
@@ -23313,6 +23395,7 @@ PyInit__core(void)
     SET_REF(Tensor, "Tensor");
     SET_REF(TensorMeta, "TensorMeta");
     SET_REF(dtype_strings, "DTYPE_STRINGS");
+    SET_REF(numpy_to_handle, "_numpy_to_tensor_handle");
     Py_DECREF(temp_module);
 
     temp_module = PyImport_ImportModule("types");
@@ -23407,6 +23490,8 @@ PyInit__core(void)
     CACHED_STRING(str_enc_hook, "enc_hook");
     CACHED_STRING(str_dec_hook, "dec_hook");
     CACHED_STRING(str_ext_hook, "ext_hook");
+    CACHED_STRING(str_dec_tensor, "dec_tensor");
+    CACHED_STRING(str_numpy, "numpy");
     CACHED_STRING(str_strict, "strict");
     CACHED_STRING(str_order, "order");
     CACHED_STRING(str_utcoffset, "utcoffset");

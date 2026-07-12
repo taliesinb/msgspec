@@ -206,6 +206,109 @@ class TestNumpy:
         assert np.array_equal(arr, back)
 
 
+class TestNumpyEncode:
+    def test_bare_array_auto_wraps(self):
+        np = pytest.importorskip("numpy")
+
+        arr = np.arange(6, dtype=np.float32).reshape(2, 3)
+        out = decode(encode(arr))
+        assert isinstance(out, TensorHandle)
+        assert out.dtype == "float32"
+        assert out.shape == (2, 3)
+        back = np.frombuffer(out.native, dtype=np.float32).reshape(out.shape)
+        assert np.array_equal(arr, back)
+
+    def test_non_contiguous_array(self):
+        np = pytest.importorskip("numpy")
+
+        arr = np.arange(6, dtype=np.int64).reshape(2, 3).T  # F-contiguous
+        out = decode(encode(arr))
+        back = np.frombuffer(out.native, dtype=np.int64).reshape(out.shape)
+        assert np.array_equal(arr, back)
+
+    def test_array_as_struct_field(self):
+        np = pytest.importorskip("numpy")
+
+        class M(Struct):
+            w: Tensor[2, Float32]
+
+        arr = np.ones((2, 2), dtype=np.float32)
+        out = Decoder(M).decode(encode(M(w=arr)))
+        assert isinstance(out.w, TensorHandle)
+        assert out.w.shape == (2, 2)
+
+    def test_unsupported_dtype_errors(self):
+        np = pytest.importorskip("numpy")
+
+        with pytest.raises(TypeError, match="unsupported dtype"):
+            encode(np.array([1 + 2j], dtype=np.complex128))
+
+    def test_non_numpy_unknown_still_errors(self):
+        with pytest.raises(TypeError):
+            encode(object())
+
+
+class TestDecTensorHook:
+    @staticmethod
+    def _to_numpy(shape, dtype, data):
+        np = pytest.importorskip("numpy")
+        assert isinstance(data, bytes)
+        a = np.frombuffer(data, dtype=np.dtype(dtype))
+        return a.reshape(shape) if shape is not None else a
+
+    def test_module_decode_hook(self):
+        np = pytest.importorskip("numpy")
+
+        arr = np.arange(6, dtype=np.float32).reshape(2, 3)
+        out = decode(encode(arr), dec_tensor=self._to_numpy)
+        assert isinstance(out, np.ndarray)
+        assert np.array_equal(arr, out)
+
+    def test_decoder_hook_typed_field(self):
+        np = pytest.importorskip("numpy")
+
+        class M(Struct):
+            w: Tensor[2, Float32]
+
+        arr = np.arange(4, dtype=np.float32).reshape(2, 2)
+        dec = Decoder(M, dec_tensor=self._to_numpy)
+        out = dec.decode(encode(M(w=arr)))
+        assert isinstance(out.w, np.ndarray)
+        assert np.array_equal(arr, out.w)
+
+    def test_hook_receives_bytes_shape_dtype(self):
+        seen = {}
+
+        def hook(shape, dtype, data):
+            seen["shape"] = shape
+            seen["dtype"] = dtype
+            seen["data"] = data
+            return "converted"
+
+        h = TensorHandle(b"\x01\x02\x03\x04", dtype="uint8", shape=(4,))
+        out = decode(encode(h), dec_tensor=hook)
+        assert out == "converted"
+        assert seen == {"shape": (4,), "dtype": "uint8", "data": b"\x01\x02\x03\x04"}
+
+    def test_no_hook_yields_tensorhandle(self):
+        h = TensorHandle(b"\x01\x02", dtype="uint8", shape=(2,))
+        assert isinstance(decode(encode(h)), TensorHandle)
+
+    def test_hook_attribute(self):
+        def hook(shape, dtype, data):
+            return None
+
+        dec = Decoder(dec_tensor=hook)
+        assert dec.dec_tensor is hook
+        assert Decoder().dec_tensor is None
+
+    def test_bad_hook(self):
+        with pytest.raises(TypeError, match="dec_tensor must be callable"):
+            Decoder(dec_tensor=123)
+        with pytest.raises(TypeError, match="dec_tensor must be callable"):
+            decode(encode(TensorHandle(b"x")), dec_tensor=123)
+
+
 def test_decode_no_reference_leak():
     h = TensorHandle(b"x" * 32, dtype="float32", shape=(8,))
     msg = encode(h)

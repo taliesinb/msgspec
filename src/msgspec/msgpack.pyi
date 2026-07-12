@@ -19,6 +19,9 @@ _T = TypeVar("_T")
 _EncHookSig: TypeAlias = Callable[[Any], Any] | None
 _ExtHookSig: TypeAlias = Callable[[int, memoryview], Any] | None
 _DecHookSig: TypeAlias = Callable[[type[Any], Any], Any] | None
+_DecTensorSig: TypeAlias = (
+    Callable[[tuple[int, ...] | None, str | None, bytes], Any] | None
+)
 _DecimalFormatSig: TypeAlias = (
     Callable[[decimal.Decimal], Any] | Literal["string", "number"]
 )
@@ -47,6 +50,7 @@ class Decoder(Generic[_T]):
     strict: bool
     dec_hook: _DecHookSig
     ext_hook: _ExtHookSig
+    dec_tensor: _DecTensorSig
     @overload
     def __init__(
         self: Decoder[_T],
@@ -55,6 +59,7 @@ class Decoder(Generic[_T]):
         strict: bool = True,
         dec_hook: _DecHookSig = None,
         ext_hook: _ExtHookSig = None,
+        dec_tensor: _DecTensorSig = None,
     ) -> None: ...
     @overload
     def __init__(
@@ -64,6 +69,7 @@ class Decoder(Generic[_T]):
         strict: bool = True,
         dec_hook: _DecHookSig = None,
         ext_hook: _ExtHookSig = None,
+        dec_tensor: _DecTensorSig = None,
     ) -> None: ...
     def decode(self, buf: Buffer, /) -> _T: ...
     def __class_getitem__(cls, item: Any, /) -> GenericAlias: ...
@@ -96,6 +102,7 @@ def decode(
     strict: bool = True,
     dec_hook: _DecHookSig = None,
     ext_hook: _ExtHookSig = None,
+    dec_tensor: _DecTensorSig = None,
 ) -> _T: ...
 @overload
 def decode(
@@ -106,6 +113,7 @@ def decode(
     strict: bool = True,
     dec_hook: _DecHookSig = None,
     ext_hook: _ExtHookSig = None,
+    dec_tensor: _DecTensorSig = None,
 ) -> Any: ...
 def encode(
     obj: Any,
