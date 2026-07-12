@@ -7,7 +7,7 @@ from typing import Any
 
 from . import inspect as mi
 
-__all__ = ("schema", "schema_components")
+__all__ = ("schema", "schema_components", "codec")
 
 # Matches a valid (unquoted) TypeScript identifier.
 _IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
@@ -393,3 +393,355 @@ class _SchemaGenerator:
         elems = ", ".join(self.to_ref(f.type) for f in t.fields)
         lines.append(f"export type {name} = [{elems}];")
         return "\n".join(lines)
+
+
+# Types whose TypeScript value is already exactly the MessagePack wire value, so
+# encoding/decoding is the identity (no transform needed).
+_SCALAR_IDENTITY = (
+    mi.AnyType,
+    mi.RawType,
+    mi.NoneType,
+    mi.BoolType,
+    mi.IntType,
+    mi.FloatType,
+    mi.StrType,
+    mi.BytesType,
+    mi.ByteArrayType,
+    mi.MemoryViewType,
+    mi.DateTimeType,
+    mi.TimeType,
+    mi.DateType,
+    mi.TimeDeltaType,
+    mi.UUIDType,
+    mi.DecimalType,
+    mi.EnumType,
+    mi.LiteralType,
+    mi.ScalarType,
+)
+
+# Object/tuple-like components that get a generated encode/decode function pair.
+_CODEC_FUNC_TYPES = (
+    mi.StructType,
+    mi.TypedDictType,
+    mi.DataclassType,
+    mi.NamedTupleType,
+)
+
+
+def _is_identity(t: mi.Type) -> bool:
+    """Whether a value of this type round-trips through MessagePack unchanged
+    (so its codec is the identity function)."""
+    while isinstance(t, mi.Metadata):
+        t = t.type
+    if isinstance(t, _SCALAR_IDENTITY):
+        return True
+    if isinstance(t, (mi.ListType, mi.VarTupleType)):
+        return _is_identity(t.item_type)
+    if isinstance(t, mi.TupleType):
+        return all(_is_identity(i) for i in t.item_types)
+    if isinstance(t, (mi.DictType, mi.FrozenDictType)):
+        return _is_identity(t.value_type)
+    if isinstance(t, mi.AliasType):
+        return _is_identity(t.value)
+    if isinstance(t, mi.UnionType):
+        # A union with a struct member needs tag dispatch; otherwise (scalars,
+        # optionals of scalars) it passes through.
+        return all(_is_identity(a) for a in t.types)
+    # Structs, dataclasses, typed-dicts, named-tuples, sets, tensors: not identity.
+    return False
+
+
+def _unwrap(t: mi.Type) -> mi.Type:
+    while isinstance(t, mi.Metadata):
+        t = t.type
+    return t
+
+
+class _CodecGenerator:
+    """Emits TypeScript encode/decode functions via structural recursion.
+
+    Encoders emit the discriminant tag for tagged-union structs; decoders
+    dispatch on that tag. Validation is intentionally not performed.
+    """
+
+    def __init__(self, name_map: dict[Any, str]):
+        self.name_map = name_map
+        self.schema = _SchemaGenerator(name_map)
+
+    # -- expression helpers -------------------------------------------------
+    def enc(self, t: mi.Type, expr: str) -> str:
+        """A TS expression encoding the typed value ``expr`` to wire form."""
+        t = _unwrap(t)
+        if _is_identity(t):
+            return expr
+        if isinstance(t, _CODEC_FUNC_TYPES):
+            return f"encode{self.name_map[t.cls]}({expr})"
+        if isinstance(t, mi.AliasType):
+            return self.enc(t.value, expr)
+        if isinstance(t, (mi.ListType, mi.VarTupleType)):
+            return f"{expr}.map((v) => {self.enc(t.item_type, 'v')})"
+        if isinstance(t, (mi.SetType, mi.FrozenSetType)):
+            inner = self.enc(t.item_type, "v")
+            return f"[...{expr}]" if inner == "v" else f"[...{expr}].map((v) => {inner})"
+        if isinstance(t, mi.TupleType):
+            elems = ", ".join(
+                self.enc(it, f"{expr}[{i}]") for i, it in enumerate(t.item_types)
+            )
+            return f"[{elems}]"
+        if isinstance(t, (mi.DictType, mi.FrozenDictType)):
+            return (
+                f"Object.fromEntries(Object.entries({expr})"
+                f".map(([k, v]) => [k, {self.enc(t.value_type, 'v')}]))"
+            )
+        if isinstance(t, mi.UnionType):
+            return self._enc_union(t, expr)
+        raise NotImplementedError(
+            f"TypeScript codec doesn't support type {t!r} yet"
+        )
+
+    def dec(self, t: mi.Type, expr: str) -> str:
+        """A TS expression decoding the wire value ``expr`` to typed form."""
+        t = _unwrap(t)
+        if _is_identity(t):
+            return f"({expr} as {self.schema.to_ref(t)})"
+        if isinstance(t, _CODEC_FUNC_TYPES):
+            return f"decode{self.name_map[t.cls]}({expr})"
+        if isinstance(t, mi.AliasType):
+            return self.dec(t.value, expr)
+        if isinstance(t, (mi.ListType, mi.VarTupleType)):
+            return f"({expr} as unknown[]).map((v) => {self.dec(t.item_type, 'v')})"
+        if isinstance(t, (mi.SetType, mi.FrozenSetType)):
+            return (
+                f"new Set(({expr} as unknown[])"
+                f".map((v) => {self.dec(t.item_type, 'v')}))"
+            )
+        if isinstance(t, mi.TupleType):
+            elems = ", ".join(
+                self.dec(it, f"({expr} as unknown[])[{i}]")
+                for i, it in enumerate(t.item_types)
+            )
+            return f"[{elems}]"
+        if isinstance(t, (mi.DictType, mi.FrozenDictType)):
+            return (
+                f"Object.fromEntries(Object.entries({expr} as Record<string, unknown>)"
+                f".map(([k, v]) => [k, {self.dec(t.value_type, 'v')}]))"
+            )
+        if isinstance(t, mi.UnionType):
+            return self._dec_union(t, expr)
+        raise NotImplementedError(
+            f"TypeScript codec doesn't support type {t!r} yet"
+        )
+
+    # -- unions -------------------------------------------------------------
+    def _partition_union(self, t: mi.UnionType):
+        members = [_unwrap(m) for m in t.types]
+        has_none = any(isinstance(m, mi.NoneType) for m in members)
+        tagged = [
+            m
+            for m in members
+            if isinstance(m, mi.StructType)
+            and not m.array_like
+            and m.tag_field is not None
+        ]
+        others = [
+            m
+            for m in members
+            if not isinstance(m, mi.NoneType) and m not in tagged
+        ]
+        return has_none, tagged, others
+
+    def _enc_union(self, t: mi.UnionType, expr: str) -> str:
+        has_none, tagged, others = self._partition_union(t)
+        if not tagged:
+            if has_none and len(others) == 1:
+                return f"({expr} === null ? null : {self.enc(others[0], expr)})"
+            # scalar-only unions are identity; anything else passes through.
+            return expr
+        return self._union_iife(tagged, others, has_none, expr, "encode")
+
+    def _dec_union(self, t: mi.UnionType, expr: str) -> str:
+        has_none, tagged, others = self._partition_union(t)
+        if not tagged:
+            if has_none and len(others) == 1:
+                return f"({expr} === null ? null : {self.dec(others[0], expr)})"
+            return f"({expr} as {self.schema.to_ref(t)})"
+        return self._union_iife(tagged, others, has_none, expr, "decode")
+
+    def _union_iife(self, tagged, others, has_none, expr, kind: str) -> str:
+        tag_field = tagged[0].tag_field
+        body = []
+        if has_none:
+            body.append(f"{_INDENT}if (v === null) return null;")
+        body.append(f"{_INDENT}switch (v[{_literal_value(tag_field)}]) {{")
+        for m in tagged:
+            body.append(
+                f"{_INDENT}{_INDENT}case {_literal_value(m.tag)}: "
+                f"return {kind}{self.name_map[m.cls]}(v);"
+            )
+        body.append(f"{_INDENT}}}")
+        if others:
+            body.append(f"{_INDENT}return v;")
+        else:
+            body.append(
+                f"{_INDENT}throw new Error("
+                f'"unexpected tag for {_str_inner(tag_field)} union");'
+            )
+        joined = "\n".join(body)
+        return f"((v: any) => {{\n{joined}\n}})({expr})"
+
+    # -- per-component function definitions ---------------------------------
+    def enc_def(self, name: str, t: mi.Type) -> str:
+        if isinstance(t, mi.NamedTupleType) or (
+            isinstance(t, mi.StructType) and t.array_like
+        ):
+            return self._enc_array_def(name, t)
+        return self._enc_object_def(name, t)
+
+    def dec_def(self, name: str, t: mi.Type) -> str:
+        if isinstance(t, mi.NamedTupleType) or (
+            isinstance(t, mi.StructType) and t.array_like
+        ):
+            return self._dec_array_def(name, t)
+        return self._dec_object_def(name, t)
+
+    def _enc_object_def(self, name: str, t: mi.Type) -> str:
+        lines = [f"export function encode{name}(value: {name}): unknown {{"]
+        lines.append(f"{_INDENT}return {{")
+        if isinstance(t, mi.StructType) and t.tag_field is not None:
+            lines.append(
+                f"{_INDENT}{_INDENT}{_prop_name(t.tag_field)}: "
+                f"{_literal_value(t.tag)},"
+            )
+        for f in t.fields:
+            key = _prop_name(f.encode_name)
+            lines.append(
+                f"{_INDENT}{_INDENT}{key}: {self.enc(f.type, f'value[{_str(f.encode_name)}]')},"
+            )
+        lines.append(f"{_INDENT}}};")
+        lines.append("}")
+        return "\n".join(lines)
+
+    def _dec_object_def(self, name: str, t: mi.Type) -> str:
+        lines = [f"export function decode{name}(data: unknown): {name} {{"]
+        lines.append(f"{_INDENT}const o = data as Record<string, unknown>;")
+        lines.append(f"{_INDENT}return {{")
+        if isinstance(t, mi.StructType) and t.tag_field is not None:
+            lines.append(
+                f"{_INDENT}{_INDENT}{_prop_name(t.tag_field)}: "
+                f"{_literal_value(t.tag)},"
+            )
+        for f in t.fields:
+            key = _prop_name(f.encode_name)
+            lines.append(
+                f"{_INDENT}{_INDENT}{key}: {self.dec(f.type, f'o[{_str(f.encode_name)}]')},"
+            )
+        lines.append(f"{_INDENT}}} as {name};")
+        lines.append("}")
+        return "\n".join(lines)
+
+    def _enc_array_def(self, name: str, t: mi.Type) -> str:
+        # NamedTuple / array_like struct: encodes to a positional array.
+        offset = 0
+        head = []
+        if isinstance(t, mi.StructType) and t.tag_field is not None:
+            head.append(_literal_value(t.tag))
+            offset = 1
+        elems = head + [
+            self.enc(f.type, f"value[{i + offset}]") for i, f in enumerate(t.fields)
+        ]
+        body = ", ".join(elems)
+        return (
+            f"export function encode{name}(value: {name}): unknown {{\n"
+            f"{_INDENT}return [{body}];\n}}"
+        )
+
+    def _dec_array_def(self, name: str, t: mi.Type) -> str:
+        offset = 0
+        head = []
+        if isinstance(t, mi.StructType) and t.tag_field is not None:
+            head.append(_literal_value(t.tag))
+            offset = 1
+        elems = head + [
+            self.dec(f.type, f"a[{i + offset}]") for i, f in enumerate(t.fields)
+        ]
+        body = ", ".join(elems)
+        return (
+            f"export function decode{name}(data: unknown): {name} {{\n"
+            f"{_INDENT}const a = data as unknown[];\n"
+            f"{_INDENT}return [{body}] as {name};\n}}"
+        )
+
+
+def _str_inner(s: str) -> str:
+    """Escape a string for use inside a double-quoted TS string literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _str(s: str) -> str:
+    """A double-quoted TS string literal for a property access key."""
+    return f'"{_str_inner(s)}"'
+
+
+def codec(type: Any) -> str:
+    """Generate TypeScript type definitions plus MessagePack encoders/decoders
+    for a given type.
+
+    The output imports ``encode``/``decode`` from ``@msgpack/msgpack`` and adds
+    an ``encode(value)`` / ``decode(bytes)`` pair for the top-level type, along
+    with per-struct ``encodeX``/``decodeX`` functions. Encoders emit the
+    discriminant tag for tagged-union structs; decoders dispatch on it. No
+    runtime validation is performed - this is a structural transform.
+
+    Parameters
+    ----------
+    type : type
+        The type to generate a codec for.
+
+    Returns
+    -------
+    str
+        The generated TypeScript source.
+
+    See Also
+    --------
+    schema
+    """
+    type_infos = mi.multi_type_info([type], aliases=True)
+    (root,) = type_infos
+    component_types = _collect_component_types(type_infos)
+    name_map = _build_name_map(component_types)
+
+    schema_gen = _SchemaGenerator(name_map)
+    codec_gen = _CodecGenerator(name_map)
+
+    parts = [
+        'import { encode as _mpEncode, decode as _mpDecode } '
+        'from "@msgpack/msgpack";'
+    ]
+
+    # Type definitions (same as `schema`).
+    for cls, t in component_types.items():
+        parts.append(schema_gen.to_def(name_map[cls], t))
+
+    root_ref = schema_gen.to_ref(root)
+    if getattr(root, "cls", None) not in name_map:
+        parts.append(f"export type Root = {root_ref};")
+        root_ref = "Root"
+
+    # Per-component encode/decode functions.
+    for cls, t in component_types.items():
+        if isinstance(t, _CODEC_FUNC_TYPES):
+            parts.append(codec_gen.enc_def(name_map[cls], t))
+            parts.append(codec_gen.dec_def(name_map[cls], t))
+
+    # Top-level entry points.
+    parts.append(
+        f"export function encode(value: {root_ref}): Uint8Array {{\n"
+        f"{_INDENT}return _mpEncode({codec_gen.enc(root, 'value')});\n}}"
+    )
+    parts.append(
+        f"export function decode(bytes: Uint8Array): {root_ref} {{\n"
+        f"{_INDENT}return {codec_gen.dec(root, '_mpDecode(bytes)')} as {root_ref};\n}}"
+    )
+
+    return "\n\n".join(parts) + "\n"

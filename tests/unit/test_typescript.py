@@ -182,6 +182,121 @@ def test_ext_type_raises():
         ts(msgspec.msgpack.Ext)
 
 
+def cc(type):
+    return msgspec.typescript.codec(type)
+
+
+class TestCodec:
+    def test_imports_msgpack(self):
+        class P(Struct):
+            x: int
+
+        out = cc(P)
+        assert 'from "@msgpack/msgpack"' in out
+
+    def test_includes_schema_and_toplevel(self):
+        class P(Struct):
+            x: int
+
+        out = cc(P)
+        assert "export class P {" in out
+        assert "export function encode(value: P): Uint8Array {" in out
+        assert "return _mpEncode(encodeP(value));" in out
+        assert "export function decode(bytes: Uint8Array): P {" in out
+        assert "return decodeP(_mpDecode(bytes)) as P;" in out
+
+    def test_struct_encode_decode(self):
+        class P(Struct):
+            x: int
+            y: str
+
+        out = cc(P)
+        assert "export function encodeP(value: P): unknown {" in out
+        assert 'x: value["x"],' in out
+        assert "export function decodeP(data: unknown): P {" in out
+        assert 'x: (o["x"] as number),' in out
+
+    def test_tagged_union_emits_tag_on_encode(self):
+        class Cat(Struct, tag="cat"):
+            n: int
+
+        class Dog(Struct, tag="dog"):
+            n: int
+
+        class Holder(Struct):
+            pet: Union[Cat, Dog]
+
+        out = cc(Holder)
+        # encoder for a tagged struct emits the literal tag
+        assert 'type: "cat",' in out
+        # union encode/decode dispatch on the tag field
+        assert 'switch (v["type"]) {' in out
+        assert 'case "cat": return encodeCat(v);' in out
+        assert 'case "cat": return decodeCat(v);' in out
+
+    def test_optional_null_check(self):
+        class P(Struct):
+            x: int
+
+        class Holder(Struct):
+            maybe: Optional[P]
+
+        out = cc(Holder)
+        assert '=== null ? null : encodeP(value["maybe"])' in out
+        assert '=== null ? null : decodeP(o["maybe"])' in out
+
+    def test_list_maps(self):
+        class P(Struct):
+            x: int
+
+        class Holder(Struct):
+            items: List[P]
+
+        out = cc(Holder)
+        assert 'value["items"].map((v) => encodeP(v))' in out
+        assert '(o["items"] as unknown[]).map((v) => decodeP(v))' in out
+
+    def test_scalar_identity(self):
+        class P(Struct):
+            a: int
+            b: str
+            c: bool
+
+        out = cc(P)
+        assert 'a: value["a"],' in out  # no transform
+        assert 'a: (o["a"] as number),' in out
+
+    def test_non_nameable_root_alias(self):
+        class P(Struct):
+            x: int
+
+        out = cc(List[P])
+        assert "export type Root = Array<P>;" in out
+        assert "value.map((v) => encodeP(v))" in out
+
+    def test_array_like_struct_positional(self):
+        class Rec(Struct, array_like=True):
+            a: int
+            b: str
+
+        out = cc(Rec)
+        assert "return [value[0], value[1]];" in out
+        assert "const a = data as unknown[];" in out
+
+    def test_enum_and_alias_identity(self):
+        import enum
+
+        class Color(enum.Enum):
+            RED = "red"
+
+        class P(Struct):
+            c: Color
+
+        out = cc(P)
+        assert 'c: value["c"],' in out
+        assert 'c: (o["c"] as Color),' in out
+
+
 def test_newtype_alias_emitted_as_type():
     Pixels = NewType("Pixels", int)
 
