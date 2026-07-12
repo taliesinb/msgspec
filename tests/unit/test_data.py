@@ -315,14 +315,19 @@ class TestJsonEncode:
 
         h = TensorHandle(b"\x00\x01\x02\x03", dtype="uint8", shape=(2, 2))
         out = json.loads(msgspec.json.encode(h))
-        assert out == {"shape": [2, 2], "dtype": "uint8", "data": "AAECAw=="}
+        assert out == {
+            "type": "tensor",
+            "shape": [2, 2],
+            "dtype": "uint8",
+            "data": "AAECAw==",
+        }
 
     def test_none_dtype_shape_json(self):
         import json
 
         h = TensorHandle(b"\x00\x01")
         out = json.loads(msgspec.json.encode(h))
-        assert out == {"shape": None, "dtype": None, "data": "AAE="}
+        assert out == {"type": "tensor", "shape": None, "dtype": None, "data": "AAE="}
 
     def test_numpy_json(self):
         np = pytest.importorskip("numpy")

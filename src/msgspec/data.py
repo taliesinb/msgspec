@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Literal, TypeAliasType, cast
+from typing import Any, Literal, cast
+
+try:  # `TypeAliasType` is stdlib on 3.12+, backported by typing_extensions before.
+    from typing import TypeAliasType
+except ImportError:  # pragma: no cover - Python < 3.12
+    from typing_extensions import TypeAliasType
 
 __all__ = [  # noqa: F822  (TensorHandle is provided via module __getattr__)
     'UInt8',
@@ -20,39 +25,45 @@ __all__ = [  # noqa: F822  (TensorHandle is provided via module __getattr__)
     'TensorHandle',
 ]
 
-type UInt8 = int   # turns into ScalarType('uint8')
-type UInt16 = int
-type UInt32 = int
-type UInt64 = int
-type Int8 = int
-type Int16 = int
-type Int32 = int
-type Int64 = int
-type Float32 = float
-type Float64 = float
-type Bool = bool
+# `X = TypeAliasType("X", value)` is the back-compatible spelling of the PEP 695
+# `type X = value` statement (which is 3.12+ syntax). Each of these turns into a
+# `ScalarType(<name>)` when inspected, e.g. `UInt8` -> `ScalarType('uint8')`.
+UInt8 = TypeAliasType("UInt8", int)
+UInt16 = TypeAliasType("UInt16", int)
+UInt32 = TypeAliasType("UInt32", int)
+UInt64 = TypeAliasType("UInt64", int)
+Int8 = TypeAliasType("Int8", int)
+Int16 = TypeAliasType("Int16", int)
+Int32 = TypeAliasType("Int32", int)
+Int64 = TypeAliasType("Int64", int)
+Float32 = TypeAliasType("Float32", float)
+Float64 = TypeAliasType("Float64", float)
+Bool = TypeAliasType("Bool", bool)
 
-type Scalar = int | float | bool
+Scalar = TypeAliasType("Scalar", int | float | bool)
 
-type DType = Literal[
-    'uint8',
-    'uint16',
-    'uint32',
-    'uint64',
-    'int8',
-    'int16',
-    'int32',
-    'int64',
-    'float32',
-    'float64',
-    'bool'
-]
+DType = TypeAliasType(
+    "DType",
+    Literal[
+        'uint8',
+        'uint16',
+        'uint32',
+        'uint64',
+        'int8',
+        'int16',
+        'int32',
+        'int64',
+        'float32',
+        'float64',
+        'bool',
+    ],
+)
 
 # ---
 
-type NumAxes = int
-type AxisSize = int | None
-type AxisSizes = tuple[AxisSize, ...]
+NumAxes = TypeAliasType("NumAxes", int)
+AxisSize = TypeAliasType("AxisSize", int | None)
+AxisSizes = TypeAliasType("AxisSizes", tuple[AxisSize, ...])
 
 # -----
 

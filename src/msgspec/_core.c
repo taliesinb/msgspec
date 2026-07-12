@@ -14417,20 +14417,25 @@ json_encode_memoryview(EncoderState *self, PyObject *obj)
     return out;
 }
 
-/* Encode a tensor as a JSON object {"shape": ..., "dtype": ..., "data": <b64>}.
- * Built as a dict and delegated to `json_encode` so the raw buffer reuses the
- * bytes->base64 path and shape/dtype reuse array/string encoding. */
+/* Encode a tensor as a JSON object
+ * {"type": "tensor", "shape": ..., "dtype": ..., "data": <b64>}.
+ * The leading "type" tag marks the object's provenance. Built as a dict and
+ * delegated to `json_encode` so the raw buffer reuses the bytes->base64 path
+ * and shape/dtype reuse array/string encoding. */
 static int
 json_encode_tensorhandle(EncoderState *self, PyObject *obj)
 {
     TensorHandle *th = (TensorHandle *)obj;
-    PyObject *d = NULL, *mv = NULL;
+    PyObject *d = NULL, *mv = NULL, *tag = NULL;
     int status = -1;
 
     mv = PyMemoryView_FromObject(th->native);
     if (mv == NULL) return -1;
+    tag = PyUnicode_FromString("tensor");
+    if (tag == NULL) goto done;
     d = PyDict_New();
     if (d == NULL) goto done;
+    if (PyDict_SetItemString(d, "type", tag) < 0) goto done;
     if (PyDict_SetItemString(d, "shape", th->shape) < 0) goto done;
     if (PyDict_SetItemString(d, "dtype", th->dtype) < 0) goto done;
     if (PyDict_SetItemString(d, "data", mv) < 0) goto done;
@@ -14438,6 +14443,7 @@ json_encode_tensorhandle(EncoderState *self, PyObject *obj)
 done:
     Py_XDECREF(d);
     Py_XDECREF(mv);
+    Py_XDECREF(tag);
     return status;
 }
 
