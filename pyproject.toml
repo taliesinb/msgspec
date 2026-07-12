@@ -110,6 +110,8 @@ test-unit = [
   "pyyaml",
   "tomli; python_version < '3.11'",
   "tomli-w",
+  # `msgspec.data` builds TypeAliasType aliases, which need the backport < 3.12.
+  "typing_extensions; python_version < '3.12'",
 ]
 
 [tool.setuptools]

@@ -11,8 +11,13 @@ from typing import Any, Final, Literal, TypeVar, Union
 
 try:
     from typing import TypeAliasType as _TypeAliasType  # type: ignore
-except Exception:
-    _TypeAliasType = type("TypeAliasType", (), {})  # type: ignore
+except ImportError:
+    try:
+        # Backported for Python < 3.12. Must match the class `data.py` uses to
+        # build its aliases so `type(typ) is _TypeAliasType` checks succeed.
+        from typing_extensions import TypeAliasType as _TypeAliasType  # type: ignore
+    except ImportError:
+        _TypeAliasType = type("TypeAliasType", (), {})  # type: ignore
 
 import msgspec
 from msgspec import NODEFAULT, UNSET, UnsetType as _UnsetType
@@ -29,13 +34,10 @@ from ._utils import (  # type: ignore
     get_dataclass_info as _get_dataclass_info,
     get_typeddict_info as _get_typeddict_info,
 )
-
 from .data import (
-    Tensor,
-    Scalar,
-    DType,
     DTYPE_ALIASES,
-    DTYPE_STRINGS,
+    DType,
+    Scalar,
     TensorMeta as _TensorMeta,
     parse_dtype as _parse_dtype,
 )
