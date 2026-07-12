@@ -62,22 +62,30 @@ def parse_shape(
 # (`Float32`, `float`, ...), a dtype string, or `None` for "any".
 _Dtype: TypeAlias = type[int] | type[float] | type[bool] | DType | None
 
+# `Tensor` is subscripted at runtime via `TensorMeta.__getitem__` (below).
+# Type checkers, however, only consult `TensorMeta.__getitem__` for subscripts
+# in *value* position (`x = Tensor[3, Float32]`), where they do validate the
+# arguments; in *annotation* position (`field: Tensor[3, Float32]`) they instead
+# require `Tensor.__class_getitem__`, and there the arguments are accepted but
+# not validated (`shape` being a value, not a type). So both are declared: the
+# metaclass form (matching the runtime) gives value-position checking, and the
+# `__class_getitem__` form makes annotations resolve.
 class TensorMeta(type):
     ndims: int | None
     sizes: tuple[int | None, ...] | None
     dtype: DType | None
-
-class Tensor(metaclass=TensorMeta):
-    # `Tensor[shape, dtype]`. Note: `shape` is a value (an int rank or a sizes
-    # tuple), not a type, so full validation is limited by the type checker -
-    # pyright accepts the subscript but does not check `__class_getitem__` args,
-    # while mypy rejects value subscripts outright. The overloads document the
-    # accepted forms and are honored by checkers that validate them.
-    #
     # `Tensor[rank, dtype]` - a rank (or None for any rank)
     @overload
-    def __class_getitem__(cls, args: tuple[int | None, _Dtype]) -> type[Tensor]: ...
+    def __getitem__(cls, args: tuple[int | None, _Dtype]) -> type[Tensor]: ...
     # `Tensor[(size, ...), dtype]` - explicit per-axis sizes (each may be None)
+    @overload
+    def __getitem__(
+        cls, args: tuple[tuple[int | None, ...], _Dtype]
+    ) -> type[Tensor]: ...
+
+class Tensor(metaclass=TensorMeta):
+    @overload
+    def __class_getitem__(cls, args: tuple[int | None, _Dtype]) -> type[Tensor]: ...
     @overload
     def __class_getitem__(
         cls, args: tuple[tuple[int | None, ...], _Dtype]
