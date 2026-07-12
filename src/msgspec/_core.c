@@ -547,6 +547,7 @@ typedef struct {
     PyObject *dtype_strings;    /* tuple of dtype name strings, index == dtype code */
     PyObject *numpy_to_handle;  /* data._numpy_to_tensor_handle */
     PyObject *json_to_tensor;   /* data._json_object_to_tensor */
+    PyObject *check_tensor;     /* data._check_tensor */
     PyObject *numpy_ndarray;    /* numpy.ndarray, resolved lazily (NULL if numpy absent) */
     PyObject *str_numpy;        /* the string "numpy" */
     uint8_t gc_cycle;
@@ -3030,6 +3031,17 @@ typedef struct {
     TypeNode *types[];
 } NamedTupleInfo;
 
+/* The parsed spec of a `msgspec.data` tensor annotation. `ndims`/`sizes`/`dtype`
+ * are `None` where unconstrained (a bare `Tensor` behaves like
+ * `Tensor[None, None]`). */
+typedef struct {
+    PyObject_HEAD
+    PyObject *cls;      /* the `Tensor` / `Tensor[...]` (or TensorHandle) class */
+    PyObject *ndims;    /* int or None */
+    PyObject *sizes;    /* tuple[int | None, ...] or None */
+    PyObject *dtype;    /* str or None */
+} TensorInfo;
+
 struct StructInfo;
 
 typedef struct {
@@ -3080,11 +3092,13 @@ static PyTypeObject StructInfo_Type;
 static PyTypeObject StructMetaType;
 static PyTypeObject Ext_Type;
 static PyTypeObject TensorHandle_Type;
+static PyTypeObject TensorInfo_Type;
 static TypeNode* TypeNode_Convert(PyObject *type);
 static PyObject* StructInfo_Convert(PyObject*);
 static PyObject* TypedDictInfo_Convert(PyObject*);
 static PyObject* DataclassInfo_Convert(PyObject*);
 static PyObject* NamedTupleInfo_Convert(PyObject*);
+static PyObject* TensorInfo_Convert(PyObject*);
 
 #define StructMeta_GET_FIELDS(s) (((StructMetaObject *)(s))->struct_fields)
 #define StructMeta_GET_NFIELDS(s) (PyTuple_GET_SIZE((((StructMetaObject *)(s))->struct_fields)))
@@ -3174,6 +3188,13 @@ TypeNode_get_struct_union(TypeNode *type) {
 static MS_INLINE PyObject *
 TypeNode_get_custom(TypeNode *type) {
     /* Custom types can't be mixed with anything */
+    return type->details[0].pointer;
+}
+
+static MS_INLINE PyObject *
+TypeNode_get_tensor(TypeNode *type) {
+    /* Tensor types can only share a union with `None`, so the TensorInfo is
+     * always the first (and only) object detail. */
     return type->details[0].pointer;
 }
 
@@ -3427,6 +3448,7 @@ TypeNode_get_traverse_ranges(
         /* Number of pyobject details */
         n_obj = ms_popcount(
             type->types & (
+                MS_TYPE_TENSOR |
                 MS_TYPE_STRUCT | MS_TYPE_STRUCT_UNION |
                 MS_TYPE_STRUCT_ARRAY | MS_TYPE_STRUCT_ARRAY_UNION |
                 MS_TYPE_INTENUM | MS_TYPE_INTLITERAL |
@@ -3595,6 +3617,7 @@ typedef struct {
     PyObject *typeddict_obj;
     PyObject *dataclass_obj;
     PyObject *namedtuple_obj;
+    PyObject *tensor_obj;
     PyObject *literals;
     PyObject *literal_int_values;
     PyObject *literal_int_lookup;
@@ -3912,6 +3935,7 @@ typenode_from_collect_state(TypeNodeCollectState *state) {
 
     n_extra = ms_popcount(
         state->types & (
+            MS_TYPE_TENSOR |
             MS_TYPE_STRUCT | MS_TYPE_STRUCT_ARRAY |
             MS_TYPE_STRUCT_UNION | MS_TYPE_STRUCT_ARRAY_UNION |
             MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC |
@@ -3966,6 +3990,13 @@ typenode_from_collect_state(TypeNodeCollectState *state) {
     out->types = state->types;
     /* Populate `details` fields in order */
     e_ind = 0;
+    if (state->tensor_obj != NULL) {
+        /* Tensors are exclusive (union only with `None`), so the TensorInfo is
+         * always the sole object detail, at index 0. */
+        PyObject *info = TensorInfo_Convert(state->tensor_obj);
+        if (info == NULL) goto error;
+        out->details[e_ind++].pointer = info;
+    }
     if (state->custom_obj != NULL) {
         Py_INCREF(state->custom_obj);
         /* Add `Any` to the type node, so the individual decode functions can
@@ -4181,6 +4212,20 @@ typenode_collect_check_invariants(TypeNodeCollectState *state) {
         PyErr_Format(
             PyExc_TypeError,
             "Type unions containing a custom type may not contain any "
+            "additional types other than `None` - type `%R` is not supported",
+            state->context
+        );
+        return -1;
+    }
+
+    /* A tensor type may only share a union with `None` */
+    if (
+        state->tensor_obj != NULL &&
+        state->types & ~(MS_TYPE_TENSOR | MS_TYPE_NONE)
+    ) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "Type unions containing a tensor type may not contain any "
             "additional types other than `None` - type `%R` is not supported",
             state->context
         );
@@ -5131,15 +5176,18 @@ typenode_collect_type(TypeNodeCollectState *state, PyObject *obj) {
         state->types |= MS_TYPE_EXT;
     }
     else if (t == (PyObject *)(&TensorHandle_Type)) {
+        /* A `TensorHandle` target imposes no dtype/shape constraint. */
         state->types |= MS_TYPE_TENSOR;
+        state->tensor_obj = t;
     }
     else if (
         state->mod->TensorMeta != NULL &&
         Py_TYPE(t) == (PyTypeObject *)(state->mod->TensorMeta)
     ) {
-        /* `Tensor` or a `Tensor[...]` specialization; milestone 1 doesn't
-         * validate the dtype/shape against the annotation. */
+        /* `Tensor` (== `Tensor[None, None]`, unconstrained) or a `Tensor[...]`
+         * specialization; the parsed spec is stored as a `TensorInfo`. */
         state->types |= MS_TYPE_TENSOR;
+        state->tensor_obj = t;
     }
     else if (t == (PyObject *)(&Raw_Type)) {
         /* Raw is marked with a typecode of 0, nothing to do */
@@ -9096,6 +9144,132 @@ static PyTypeObject DataclassInfo_Type = {
     .tp_traverse = (traverseproc)DataclassInfo_traverse,
     .tp_dealloc = (destructor)DataclassInfo_dealloc,
 };
+
+static int
+TensorInfo_traverse(TensorInfo *self, visitproc visit, void *arg)
+{
+    Py_VISIT(self->cls);
+    Py_VISIT(self->ndims);
+    Py_VISIT(self->sizes);
+    Py_VISIT(self->dtype);
+    return 0;
+}
+
+static int
+TensorInfo_clear(TensorInfo *self)
+{
+    Py_CLEAR(self->cls);
+    Py_CLEAR(self->ndims);
+    Py_CLEAR(self->sizes);
+    Py_CLEAR(self->dtype);
+    return 0;
+}
+
+static void
+TensorInfo_dealloc(TensorInfo *self)
+{
+    PyObject_GC_UnTrack(self);
+    TensorInfo_clear(self);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyObject *
+TensorInfo_repr(TensorInfo *self)
+{
+    return PyUnicode_FromFormat(
+        "TensorInfo(ndims=%R, sizes=%R, dtype=%R)",
+        self->ndims, self->sizes, self->dtype
+    );
+}
+
+static PyMemberDef TensorInfo_members[] = {
+    {"cls", T_OBJECT_EX, offsetof(TensorInfo, cls), READONLY, "The tensor class"},
+    {"ndims", T_OBJECT_EX, offsetof(TensorInfo, ndims), READONLY, "The required rank, or None"},
+    {"sizes", T_OBJECT_EX, offsetof(TensorInfo, sizes), READONLY, "The required per-axis sizes, or None"},
+    {"dtype", T_OBJECT_EX, offsetof(TensorInfo, dtype), READONLY, "The required dtype, or None"},
+    {NULL},
+};
+
+static PyTypeObject TensorInfo_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "msgspec._core.TensorInfo",
+    .tp_basicsize = sizeof(TensorInfo),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .tp_clear = (inquiry)TensorInfo_clear,
+    .tp_traverse = (traverseproc)TensorInfo_traverse,
+    .tp_dealloc = (destructor)TensorInfo_dealloc,
+    .tp_repr = (reprfunc)TensorInfo_repr,
+    .tp_members = TensorInfo_members,
+};
+
+/* Read a `TensorInfo` cached on the class's *own* namespace (not inherited -
+ * every `Tensor[...]` subclasses `Tensor`, so an inherited cache would alias).
+ * Returns a new reference, or NULL if not cached. */
+static PyObject *
+TensorInfo_get_cached(MsgspecState *mod, PyObject *cls)
+{
+    if (!PyType_Check(cls)) return NULL;
+    PyObject *d = ((PyTypeObject *)cls)->tp_dict;
+    if (d == NULL) return NULL;
+    PyObject *cached = PyDict_GetItemWithError(d, mod->str___msgspec_cache__);
+    if (cached == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    if (Py_TYPE(cached) == &TensorInfo_Type) {
+        Py_INCREF(cached);
+        return cached;
+    }
+    return NULL;
+}
+
+static PyObject *
+TensorInfo_Convert(PyObject *cls)
+{
+    MsgspecState *mod = msgspec_get_global_state();
+    PyObject *cached = TensorInfo_get_cached(mod, cls);
+    if (cached != NULL) return cached;
+
+    /* A bare `Tensor` (== `Tensor[None, None]`) or a `TensorHandle` target has
+     * no concrete ndims/sizes/dtype, so any attribute that is absent or not of
+     * the expected type is treated as "unconstrained" (None). */
+    PyObject *ndims = PyObject_GetAttrString(cls, "ndims");
+    if (ndims == NULL || (ndims != Py_None && !PyLong_Check(ndims))) {
+        PyErr_Clear();
+        Py_XDECREF(ndims);
+        ndims = Py_NewRef(Py_None);
+    }
+    PyObject *sizes = PyObject_GetAttrString(cls, "sizes");
+    if (sizes == NULL || (sizes != Py_None && !PyTuple_Check(sizes))) {
+        PyErr_Clear();
+        Py_XDECREF(sizes);
+        sizes = Py_NewRef(Py_None);
+    }
+    PyObject *dtype = PyObject_GetAttrString(cls, "dtype");
+    if (dtype == NULL || (dtype != Py_None && !PyUnicode_Check(dtype))) {
+        PyErr_Clear();
+        Py_XDECREF(dtype);
+        dtype = Py_NewRef(Py_None);
+    }
+
+    TensorInfo *info = PyObject_GC_New(TensorInfo, &TensorInfo_Type);
+    if (info == NULL) {
+        Py_DECREF(ndims); Py_DECREF(sizes); Py_DECREF(dtype);
+        return NULL;
+    }
+    info->cls = Py_NewRef(cls);
+    info->ndims = ndims;
+    info->sizes = sizes;
+    info->dtype = dtype;
+    PyObject_GC_Track(info);
+
+    /* Best-effort cache on the class. Static types (e.g. TensorHandle) are
+     * immutable, so ignore failures there. */
+    if (PyObject_SetAttr(cls, mod->str___msgspec_cache__, (PyObject *)info) < 0) {
+        PyErr_Clear();
+    }
+    return (PyObject *)info;
+}
 
 static PyObject *
 NamedTupleInfo_Convert(PyObject *obj) {
@@ -16880,7 +17054,7 @@ mpack_decode_map(
  * bytes object that `native` (a memoryview) then views. */
 static PyObject *
 mpack_decode_tensorhandle(
-    DecoderState *self, char *data_buf, Py_ssize_t size, PathNode *path
+    DecoderState *self, char *data_buf, Py_ssize_t size, TypeNode *type, PathNode *path
 ) {
     MsgspecState *mod = msgspec_get_global_state();
     PyObject *dtype = NULL, *shape = NULL, *raw = NULL, *native = NULL, *out = NULL;
@@ -16931,6 +17105,19 @@ mpack_decode_tensorhandle(
         goto done;
     }
 
+    /* Validate the decoded dtype/shape against the annotation (if any). */
+    if (type->types & MS_TYPE_TENSOR) {
+        PyObject *info = TypeNode_get_tensor(type);
+        PyObject *r = PyObject_CallFunctionObjArgs(
+            mod->check_tensor, info, dtype, shape, NULL
+        );
+        if (r == NULL) {
+            ms_maybe_wrap_validation_error(path);
+            goto done;
+        }
+        Py_DECREF(r);
+    }
+
     /* raw payload bytes */
     raw = PyBytes_FromStringAndSize(data_buf + off, size - off);
     if (raw == NULL) goto done;
@@ -16971,7 +17158,7 @@ mpack_decode_ext(
     if (mpack_read(self, &data_buf, size) < 0) return NULL;
 
     if (code == MS_EXT_TENSOR_CODE && (type->types & (MS_TYPE_TENSOR | MS_TYPE_ANY))) {
-        return mpack_decode_tensorhandle(self, data_buf, size, path);
+        return mpack_decode_tensorhandle(self, data_buf, size, type, path);
     }
     else if (type->types & MS_TYPE_DATETIME && code == -1) {
         return mpack_decode_datetime(self, data_buf, size, type, path);
@@ -19643,10 +19830,12 @@ json_decode_object(
         PyObject *obj = json_decode_dict(self, type, &type_any, &type_any, path);
         if (obj == NULL) return NULL;
         PyObject *dt = self->dec_tensor == NULL ? Py_None : self->dec_tensor;
+        PyObject *info = TypeNode_get_tensor(type);
         PyObject *out = PyObject_CallFunctionObjArgs(
-            mod->json_to_tensor, obj, dt, NULL
+            mod->json_to_tensor, obj, dt, info, NULL
         );
         Py_DECREF(obj);
+        if (out == NULL) ms_maybe_wrap_validation_error(path);
         return out;
     }
     else if (type->types & MS_TYPE_ANY) {
@@ -23198,6 +23387,7 @@ msgspec_clear(PyObject *m)
     Py_CLEAR(st->dtype_strings);
     Py_CLEAR(st->numpy_to_handle);
     Py_CLEAR(st->json_to_tensor);
+    Py_CLEAR(st->check_tensor);
     Py_CLEAR(st->numpy_ndarray);
     Py_CLEAR(st->str_numpy);
     return 0;
@@ -23282,6 +23472,7 @@ msgspec_traverse(PyObject *m, visitproc visit, void *arg)
     Py_VISIT(st->dtype_strings);
     Py_VISIT(st->numpy_to_handle);
     Py_VISIT(st->json_to_tensor);
+    Py_VISIT(st->check_tensor);
     Py_VISIT(st->numpy_ndarray);
     Py_VISIT(st->str_numpy);
     return 0;
@@ -23330,6 +23521,8 @@ PyInit__core(void)
         return NULL;
     if (PyType_Ready(&DataclassInfo_Type) < 0)
         return NULL;
+    if (PyType_Ready(&TensorInfo_Type) < 0)
+        return NULL;
     if (PyType_Ready(&NamedTupleInfo_Type) < 0)
         return NULL;
     if (PyType_Ready(&StructInfo_Type) < 0)
@@ -23372,6 +23565,8 @@ PyInit__core(void)
     if (PyModule_AddObjectRef(m, "StructConfig", (PyObject *)&StructConfig_Type) < 0)
         return NULL;
     if (PyModule_AddObjectRef(m, "TensorHandle", (PyObject *)&TensorHandle_Type) < 0)
+        return NULL;
+    if (PyModule_AddObjectRef(m, "TensorInfo", (PyObject *)&TensorInfo_Type) < 0)
         return NULL;
     if (PyModule_AddObjectRef(m, "Ext", (PyObject *)&Ext_Type) < 0)
         return NULL;
@@ -23494,6 +23689,7 @@ PyInit__core(void)
     SET_REF(dtype_strings, "DTYPE_STRINGS");
     SET_REF(numpy_to_handle, "_numpy_to_tensor_handle");
     SET_REF(json_to_tensor, "_json_object_to_tensor");
+    SET_REF(check_tensor, "_check_tensor");
     Py_DECREF(temp_module);
 
     temp_module = PyImport_ImportModule("types");

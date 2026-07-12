@@ -112,7 +112,7 @@ class TestRoundtrip:
 class TestTypedDecode:
     def test_tensor_annotation(self):
         h = TensorHandle(b"\x01\x02\x03", dtype="uint8", shape=(3,))
-        out = Decoder(Tensor[3, UInt8]).decode(encode(h))
+        out = Decoder(Tensor[1, UInt8]).decode(encode(h))
         assert isinstance(out, TensorHandle)
         assert out.shape == (3,)
 
@@ -128,7 +128,7 @@ class TestTypedDecode:
 
     def test_struct_field(self):
         class Layer(Struct):
-            weights: Tensor[3, Float32]
+            weights: Tensor[1, Float32]
             name: str
 
         msg = encode(
@@ -348,7 +348,7 @@ class TestJsonDecode:
     def test_typed_field_to_tensorhandle(self):
         class Layer(Struct):
             name: str
-            weights: Tensor[1, Float32]
+            weights: Tensor[1, UInt8]
 
         h = TensorHandle(b"\x00\x01\x02\x03", dtype="uint8", shape=(4,))
         msg = msgspec.json.encode({"name": "w", "weights": h})
@@ -410,6 +410,122 @@ class TestJsonDecode:
         assert msgspec.json.Decoder().dec_tensor is None
         with pytest.raises(TypeError, match="dec_tensor must be callable"):
             msgspec.json.Decoder(dec_tensor=123)
+
+
+class TestValidation:
+    @pytest.mark.parametrize("fmt", ["msgpack", "json"])
+    def test_dtype_mismatch(self, fmt):
+        mod = getattr(msgspec, fmt)
+
+        class Layer(Struct):
+            w: Tensor[1, Float32]
+
+        bad = Layer(w=TensorHandle(b"\x00\x00", dtype="int8", shape=(2,)))
+        with pytest.raises(
+            msgspec.ValidationError, match=r"Expected tensor of dtype 'float32'"
+        ):
+            mod.Decoder(Layer).decode(mod.encode(bad))
+
+    @pytest.mark.parametrize("fmt", ["msgpack", "json"])
+    def test_rank_mismatch(self, fmt):
+        mod = getattr(msgspec, fmt)
+
+        class Layer(Struct):
+            w: Tensor[2, Float32]
+
+        bad = Layer(w=TensorHandle(b"\x00" * 4, dtype="float32", shape=(4,)))
+        with pytest.raises(msgspec.ValidationError, match=r"rank 2, got rank 1"):
+            mod.Decoder(Layer).decode(mod.encode(bad))
+
+    @pytest.mark.parametrize("fmt", ["msgpack", "json"])
+    def test_size_mismatch(self, fmt):
+        mod = getattr(msgspec, fmt)
+
+        class Grid(Struct):
+            g: Tensor[(2, 3), Float32]
+
+        bad = Grid(g=TensorHandle(b"\x00" * 32, dtype="float32", shape=(2, 4)))
+        with pytest.raises(msgspec.ValidationError, match=r"axis 1 of size 3, got 4"):
+            mod.Decoder(Grid).decode(mod.encode(bad))
+
+    def test_error_includes_path(self):
+        class Layer(Struct):
+            w: Tensor[1, Float32]
+
+        bad = Layer(w=TensorHandle(b"\x00", dtype="int8", shape=(1,)))
+        with pytest.raises(msgspec.ValidationError, match=r"at `\$.w`"):
+            msgspec.msgpack.Decoder(Layer).decode(msgspec.msgpack.encode(bad))
+
+    def test_nested_path(self):
+        class Batch(Struct):
+            layers: list[Tensor[1, Float32]]
+
+        b = Batch(
+            layers=[
+                TensorHandle(b"\x00" * 4, dtype="float32", shape=(1,)),
+                TensorHandle(b"\x00", dtype="int8", shape=(1,)),
+            ]
+        )
+        with pytest.raises(msgspec.ValidationError, match=r"at `\$.layers\[1\]`"):
+            msgspec.msgpack.Decoder(Batch).decode(msgspec.msgpack.encode(b))
+
+    def test_valid_passes(self):
+        class Grid(Struct):
+            g: Tensor[(2, 3), Float32]
+
+        ok = Grid(g=TensorHandle(b"\x00" * 24, dtype="float32", shape=(2, 3)))
+        out = msgspec.msgpack.Decoder(Grid).decode(msgspec.msgpack.encode(ok))
+        assert out.g.shape == (2, 3)
+
+    @pytest.mark.parametrize("typ", [Tensor, TensorHandle])
+    def test_bare_tensor_and_handle_unconstrained(self, typ):
+        # a wildly-shaped/typed tensor decodes fine against an unconstrained target
+        h = TensorHandle(b"\x00" * 8, dtype="int8", shape=(2, 2, 2))
+        out = msgspec.msgpack.decode(msgspec.msgpack.encode(h), type=typ)
+        assert isinstance(out, TensorHandle)
+
+    def test_any_decode_not_validated(self):
+        # untyped msgpack decode yields a TensorHandle without any checking
+        h = TensorHandle(b"\x00", dtype="int8", shape=(1,))
+        out = msgspec.msgpack.decode(msgspec.msgpack.encode(h))
+        assert isinstance(out, TensorHandle)
+
+    def test_union_with_non_none_rejected(self):
+        with pytest.raises(msgspec.ValidationError):
+            # decoding an int where a tensor is expected
+            msgspec.msgpack.Decoder(Tensor[1, Float32]).decode(
+                msgspec.msgpack.encode(1)
+            )
+
+    def test_tensor_union_invariant(self):
+        with pytest.raises(TypeError, match="tensor type"):
+            msgspec.msgpack.Decoder(Tensor[1, Float32] | int)
+        # union with None is allowed
+        msgspec.msgpack.Decoder(Tensor[1, Float32] | None)
+
+
+class TestTensorInfo:
+    def test_exposed_and_parsed(self):
+        from msgspec._core import TensorInfo
+
+        cls = Tensor[(2, 3), Float32]
+        # building a decoder parses + caches the TensorInfo on the class
+        msgspec.msgpack.Decoder(cls)
+        info = cls.__msgspec_cache__
+        assert isinstance(info, TensorInfo)
+        assert info.ndims == 2
+        assert info.sizes == (2, 3)
+        assert info.dtype == "float32"
+
+    def test_bare_tensor_info_all_none(self):
+        from msgspec._core import TensorInfo
+
+        msgspec.msgpack.Decoder(Tensor)
+        info = Tensor.__msgspec_cache__
+        assert isinstance(info, TensorInfo)
+        assert info.ndims is None
+        assert info.sizes is None
+        assert info.dtype is None
 
 
 def test_decode_no_reference_leak():

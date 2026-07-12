@@ -192,10 +192,40 @@ def _numpy_to_tensor_handle(arr):
     return TensorHandle(arr, dtype=name, shape=tuple(arr.shape))
 
 
-def _json_object_to_tensor(obj, dec_tensor):
+def _check_tensor(info, dtype, shape):
+    # Validate a decoded tensor's `dtype`/`shape` against the `TensorInfo`
+    # parsed from its annotation (or `None` for an unconstrained target).
+    # Raises `ValueError` on mismatch; the C decoder wraps this in a
+    # `msgspec.ValidationError` with the decode path appended.
+    if info is None:
+        return
+    want_dtype = info.dtype
+    if want_dtype is not None and dtype != want_dtype:
+        raise ValueError(f"Expected tensor of dtype {want_dtype!r}, got {dtype!r}")
+    if shape is None:
+        return
+    want_ndims = info.ndims
+    want_sizes = info.sizes
+    if want_ndims is not None and len(shape) != want_ndims:
+        raise ValueError(
+            f"Expected tensor of rank {want_ndims}, got rank {len(shape)}"
+        )
+    if want_sizes is not None:
+        if len(shape) != len(want_sizes):
+            raise ValueError(
+                f"Expected tensor of rank {len(want_sizes)}, got rank {len(shape)}"
+            )
+        for axis, (want, got) in enumerate(zip(want_sizes, shape)):
+            if want is not None and want != got:
+                raise ValueError(
+                    f"Expected tensor with axis {axis} of size {want}, got {got}"
+                )
+
+
+def _json_object_to_tensor(obj, dec_tensor, info):
     # Convert a decoded JSON tensor object {"type", "shape", "dtype", "data"}
-    # into a TensorHandle (or, if `dec_tensor` is given, the caller's tensor).
-    # Called from the C JSON decoder when the target type is a tensor.
+    # into a TensorHandle (or, if `dec_tensor` is given, the caller's tensor),
+    # validating against `info` first. Called from the C JSON decoder.
     import base64
 
     data = obj.get("data")
@@ -203,6 +233,7 @@ def _json_object_to_tensor(obj, dec_tensor):
     shape = obj.get("shape")
     shape = tuple(shape) if shape is not None else None
     dtype = obj.get("dtype")
+    _check_tensor(info, dtype, shape)
     if dec_tensor is not None:
         return dec_tensor(shape, dtype, raw)
     from ._core import TensorHandle
