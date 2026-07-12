@@ -108,6 +108,54 @@ encoding/decoding a message with `msgspec` can be
 See [the documentation](https://msgspec.dev) for more information.
 
 
+## TypeScript codegen
+
+The `msgspec.typescript` module generates TypeScript definitions - and
+optionally MessagePack encoders/decoders - from msgspec types, for sharing a
+schema between a Python backend and a TypeScript frontend.
+
+```python
+import msgspec
+from msgspec import Struct
+
+class Point(Struct):
+    x: int
+    y: int
+
+print(msgspec.typescript.schema(Point))
+#> export class Point {
+#>   x: number;
+#>   y: number;
+#> }
+```
+
+`msgspec.typescript.codec(type)` additionally emits `encode`/`decode` functions
+(using [`@msgpack/msgpack`](https://github.com/msgpack/msgpack-javascript)) that
+produce byte-for-byte identical MessagePack to `msgspec.msgpack.encode`,
+emitting discriminant tags when encoding unions and dispatching on them when
+decoding. See the [TypeScript docs](docs/typescript.rst).
+
+
+## Tensors
+
+The `msgspec.data` module adds efficient encoding/decoding of packed
+n-dimensional arrays (e.g. [numpy](https://numpy.org/) arrays) as a MessagePack
+extension or a self-describing JSON object - with no hard dependency on numpy.
+
+```python
+import numpy as np
+import msgspec
+from msgspec.data import Tensor, Float32
+
+arr = np.arange(6, dtype=np.float32).reshape(2, 3)
+data = msgspec.msgpack.encode(arr)   # encoded as a tensor extension
+```
+
+Numpy arrays are recognized automatically on encode; a `dec_tensor` hook lets
+you decode straight back to your array type of choice. See the
+[tensor docs](docs/tensors.rst).
+
+
 ## LICENSE
 
 New BSD. See the

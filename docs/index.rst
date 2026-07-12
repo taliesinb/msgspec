@@ -191,6 +191,8 @@ few:
     constraints.rst
     converters.rst
     jsonschema.rst
+    typescript.rst
+    tensors.rst
     schema-evolution.rst
 
 .. toctree::
