@@ -14417,6 +14417,30 @@ json_encode_memoryview(EncoderState *self, PyObject *obj)
     return out;
 }
 
+/* Encode a tensor as a JSON object {"shape": ..., "dtype": ..., "data": <b64>}.
+ * Built as a dict and delegated to `json_encode` so the raw buffer reuses the
+ * bytes->base64 path and shape/dtype reuse array/string encoding. */
+static int
+json_encode_tensorhandle(EncoderState *self, PyObject *obj)
+{
+    TensorHandle *th = (TensorHandle *)obj;
+    PyObject *d = NULL, *mv = NULL;
+    int status = -1;
+
+    mv = PyMemoryView_FromObject(th->native);
+    if (mv == NULL) return -1;
+    d = PyDict_New();
+    if (d == NULL) goto done;
+    if (PyDict_SetItemString(d, "shape", th->shape) < 0) goto done;
+    if (PyDict_SetItemString(d, "dtype", th->dtype) < 0) goto done;
+    if (PyDict_SetItemString(d, "data", mv) < 0) goto done;
+    status = json_encode(self, d);
+done:
+    Py_XDECREF(d);
+    Py_XDECREF(mv);
+    return status;
+}
+
 static int
 json_encode_raw(EncoderState *self, PyObject *obj)
 {
@@ -15072,6 +15096,9 @@ json_encode_uncommon(EncoderState *self, PyTypeObject *type, PyObject *obj) {
     else if (type == &PyMemoryView_Type) {
         return json_encode_memoryview(self, obj);
     }
+    else if (type == &TensorHandle_Type) {
+        return json_encode_tensorhandle(self, obj);
+    }
     else if (type == &Raw_Type) {
         return json_encode_raw(self, obj);
     }
@@ -15100,6 +15127,16 @@ json_encode_uncommon(EncoderState *self, PyTypeObject *type, PyObject *obj) {
         if (PyDict_Contains(type->tp_dict, self->mod->str___attrs_attrs__)) {
             return json_encode_object(self, obj);
         }
+    }
+
+    /* Automatically wrap numpy arrays as tensors. */
+    PyTypeObject *ndarray = ms_numpy_ndarray(self->mod);
+    if (ndarray != NULL && PyObject_TypeCheck(obj, ndarray)) {
+        PyObject *handle = PyObject_CallOneArg(self->mod->numpy_to_handle, obj);
+        if (handle == NULL) return -1;
+        int status = json_encode_tensorhandle(self, handle);
+        Py_DECREF(handle);
+        return status;
     }
 
     if (self->enc_hook != NULL) {

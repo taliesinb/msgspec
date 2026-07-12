@@ -159,6 +159,11 @@ class Tensor(metaclass=TensorMeta):
 # re-exported here lazily via `__getattr__` so that `_core` can import this
 # module during its own initialization without a circular import.
 #
+# Supported: msgpack encode/decode (memoryview), the `dec_tensor` decode hook,
+# automatic numpy recognition on encode, and JSON encode
+# ({shape, dtype, data:base64}). Still todo: JSON *decode* of tensor objects.
+
+
 def _numpy_to_tensor_handle(arr):
     # Wrap a numpy array as a `TensorHandle`. Called from the C encoder when it
     # encounters a numpy array (numpy is never imported by msgspec itself - if

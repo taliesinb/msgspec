@@ -309,6 +309,36 @@ class TestDecTensorHook:
             decode(encode(TensorHandle(b"x")), dec_tensor=123)
 
 
+class TestJsonEncode:
+    def test_tensorhandle_json(self):
+        import json
+
+        h = TensorHandle(b"\x00\x01\x02\x03", dtype="uint8", shape=(2, 2))
+        out = json.loads(msgspec.json.encode(h))
+        assert out == {"shape": [2, 2], "dtype": "uint8", "data": "AAECAw=="}
+
+    def test_none_dtype_shape_json(self):
+        import json
+
+        h = TensorHandle(b"\x00\x01")
+        out = json.loads(msgspec.json.encode(h))
+        assert out == {"shape": None, "dtype": None, "data": "AAE="}
+
+    def test_numpy_json(self):
+        np = pytest.importorskip("numpy")
+        import base64
+        import json
+
+        arr = np.arange(4, dtype=np.float32).reshape(2, 2)
+        out = json.loads(msgspec.json.encode(arr))
+        assert out["shape"] == [2, 2]
+        assert out["dtype"] == "float32"
+        back = np.frombuffer(base64.b64decode(out["data"]), dtype=np.float32).reshape(
+            out["shape"]
+        )
+        assert np.array_equal(arr, back)
+
+
 def test_decode_no_reference_leak():
     h = TensorHandle(b"x" * 32, dtype="float32", shape=(8,))
     msg = encode(h)
