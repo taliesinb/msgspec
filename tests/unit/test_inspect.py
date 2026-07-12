@@ -218,8 +218,18 @@ def test_newtype_aliases_true():
     Pixels = NewType("Pixels", int)
     # Default (aliases=False) still resolves through the alias.
     assert mi.type_info(Pixels) == mi.IntType()
-    # aliases=True preserves the alias name and resolved value.
-    assert mi.type_info(Pixels, aliases=True) == mi.AliasType("Pixels", mi.IntType())
+    # aliases=True preserves the alias (as `cls`) and its resolved value.
+    assert mi.type_info(Pixels, aliases=True) == mi.AliasType(Pixels, mi.IntType())
+
+
+def test_alias_cache_does_not_leak_between_calls():
+    # aliases=True and aliases=False use independent (per-call) caches, so one
+    # never affects the other regardless of order.
+    Pixels = NewType("Pixels", int)
+    assert isinstance(mi.type_info(Pixels, aliases=True), mi.AliasType)
+    assert mi.type_info(Pixels) == mi.IntType()
+    assert mi.type_info(Pixels, aliases=False) == mi.IntType()
+    assert isinstance(mi.type_info(Pixels, aliases=True), mi.AliasType)
 
 
 def test_newtype_of_struct_aliases_true():
@@ -229,7 +239,7 @@ def test_newtype_of_struct_aliases_true():
     Ref = NewType("Ref", Point)
     info = mi.type_info(Ref, aliases=True)
     assert isinstance(info, mi.AliasType)
-    assert info.name == "Ref"
+    assert info.cls is Ref
     assert isinstance(info.value, mi.StructType)
     assert info.value.cls is Point
 
@@ -237,24 +247,39 @@ def test_newtype_of_struct_aliases_true():
 def test_alias_nested_and_multi():
     Pixels = NewType("Pixels", int)
     (list_info,) = mi.multi_type_info([list[Pixels]], aliases=True)
-    assert list_info == mi.ListType(mi.AliasType("Pixels", mi.IntType()))
+    assert list_info == mi.ListType(mi.AliasType(Pixels, mi.IntType()))
 
 
 @py312_plus
 @pytest.mark.parametrize(
-    "src, name, value",
+    "src, value",
     [
-        ("type Ex = int", "Ex", mi.IntType()),
-        ("type Ex = str | None", "Ex", mi.UnionType((mi.StrType(), mi.NoneType()))),
-        ("type Ex = list[int]", "Ex", mi.ListType(mi.IntType())),
+        ("type Ex = int", mi.IntType()),
+        ("type Ex = str | None", mi.UnionType((mi.StrType(), mi.NoneType()))),
+        ("type Ex = list[int]", mi.ListType(mi.IntType())),
     ],
 )
-def test_typealias_aliases_true(src, name, value):
+def test_typealias_aliases_true(src, value):
     with temp_module(src) as mod:
         # Default resolves transparently...
         assert mi.type_info(mod.Ex) == value
-        # ...aliases=True preserves the alias.
-        assert mi.type_info(mod.Ex, aliases=True) == mi.AliasType(name, value)
+        # ...aliases=True preserves the alias itself as `cls`.
+        info = mi.type_info(mod.Ex, aliases=True)
+        assert info == mi.AliasType(mod.Ex, value)
+        assert info.cls is mod.Ex
+
+
+@py312_plus
+def test_typealias_generic_specializations_distinct():
+    with temp_module("type Vec[T] = list[T]") as mod:
+        ints = mi.type_info(mod.Vec[int], aliases=True)
+        strs = mi.type_info(mod.Vec[str], aliases=True)
+        # Distinct specializations: distinct `cls`, distinct values.
+        assert ints.cls == mod.Vec[int]
+        assert strs.cls == mod.Vec[str]
+        assert ints.value == mi.ListType(mi.IntType())
+        assert strs.value == mi.ListType(mi.StrType())
+        assert ints != strs
 
 
 def test_final():

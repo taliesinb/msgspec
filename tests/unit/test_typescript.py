@@ -249,3 +249,22 @@ def test_pep695_type_alias():
         out = ts(List[mod.Pixels])
     assert "export type Pixels = number;" in out
     assert "export type Root = Array<Pixels>;" in out
+
+
+@py312_plus
+def test_pep695_generic_alias_specializations_distinct():
+    from .utils import temp_module
+
+    with temp_module("type Vec[T] = list[T]") as mod:
+
+        class Holder(Struct):
+            ints: mod.Vec[int]
+            strs: mod.Vec[str]
+
+        out = ts(Holder)
+    # Distinct specializations get distinct names (mirrors json.schema's
+    # `Box_int_` convention), so no definition is trampled.
+    assert "  ints: Vec_int;" in out
+    assert "  strs: Vec_str;" in out
+    assert "export type Vec_int = Array<number>;" in out
+    assert "export type Vec_str = Array<string>;" in out

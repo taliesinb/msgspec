@@ -332,19 +332,24 @@ class AliasType(Type):
     """A type corresponding to a named type alias.
 
     This wraps the underlying type of a `typing.NewType` or a :pep:`695`
-    ``type X = ...`` alias, preserving the alias' name. These are only emitted
+    ``type X = ...`` alias, preserving the alias itself. These are only emitted
     when `type_info`/`multi_type_info` is called with ``aliases=True``;
     otherwise aliases are transparently resolved to their underlying type.
 
+    Like `StructType.cls`, ``cls`` holds the *subscripted* alias for generic
+    specializations (e.g. ``Vec[int]``), so distinct specializations remain
+    distinguishable.
+
     Parameters
     ----------
-    name: str
-        The alias name (e.g. ``"Pixels"``).
+    cls: Any
+        The alias itself - a `typing.NewType`, a :pep:`695` ``TypeAliasType``,
+        or a subscripted generic alias like ``Vec[int]``.
     value: Type
         The resolved underlying type.
     """
 
-    name: str
+    cls: Any
     value: Type
 
 
@@ -840,11 +845,13 @@ class _Translator:
             if alias is not None:
                 if typ in self.cache:
                     return self.cache[typ]
-                name, value = alias
+                _, value = alias
+                # Store the (possibly subscripted) alias as `cls`, mirroring
+                # `StructType.cls`, so generic specializations stay distinct.
                 # Seed the cache with a placeholder before recursing so that
                 # self-referential aliases (e.g. `type JSON = int | list[JSON]`)
                 # terminate.
-                self.cache[typ] = out = AliasType(name, AnyType())
+                self.cache[typ] = out = AliasType(typ, AnyType())
                 out.value = self.translate(value)
                 return out
 

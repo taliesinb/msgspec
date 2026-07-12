@@ -75,9 +75,9 @@ def schema_components(
     # emitted as a TypeScript `type` alias rather than being inlined.
     type_infos = mi.multi_type_info(types, aliases=True)
 
-    cls_components, alias_components = _collect_component_types(type_infos)
+    component_types = _collect_component_types(type_infos)
 
-    name_map = _build_name_map(cls_components)
+    name_map = _build_name_map(component_types)
 
     gen = _SchemaGenerator(name_map)
 
@@ -85,41 +85,32 @@ def schema_components(
 
     components = {
         name_map[cls]: gen.to_def(name_map[cls], t)
-        for cls, t in cls_components.items()
+        for cls, t in component_types.items()
     }
-    for name, t in alias_components.items():
-        components[name] = gen.to_def(name, t)
     return refs, components
 
 
-def _collect_component_types(
-    type_infos: Iterable[mi.Type],
-) -> tuple[dict[Any, mi.Type], dict[str, mi.AliasType]]:
+def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type]:
     """Find all "nameable" types in the type tree worthy of a top-level
-    definition.
-
-    Returns a ``(cls_components, alias_components)`` pair: the first maps a
-    class (Struct, Dataclass, NamedTuple, TypedDict, or Enum) to its Type, the
-    second maps an alias name to its `AliasType`.
-    """
-    cls_components: dict[Any, mi.Type] = {}
-    alias_components: dict[str, mi.AliasType] = {}
+    definition (Struct, Dataclass, NamedTuple, TypedDict, Enum, and alias
+    types). All are keyed by their ``.cls`` (the alias' ``.cls`` being the
+    possibly-subscripted alias itself)."""
+    components: dict[Any, mi.Type] = {}
 
     def collect(t):
         if isinstance(t, mi.AliasType):
-            name = _ts_ident(t.name)
-            if name not in alias_components:
-                alias_components[name] = t
+            if t.cls not in components:
+                components[t.cls] = t
                 collect(t.value)
         elif isinstance(
             t, (mi.StructType, mi.TypedDictType, mi.DataclassType, mi.NamedTupleType)
         ):
-            if t.cls not in cls_components:
-                cls_components[t.cls] = t
+            if t.cls not in components:
+                components[t.cls] = t
                 for f in t.fields:
                     collect(f.type)
         elif isinstance(t, mi.EnumType):
-            cls_components[t.cls] = t
+            components[t.cls] = t
         elif isinstance(t, mi.Metadata):
             collect(t.type)
         elif isinstance(t, mi.CollectionType):
@@ -137,7 +128,7 @@ def _collect_component_types(
     for t in type_infos:
         collect(t)
 
-    return cls_components, alias_components
+    return components
 
 
 def _type_repr(obj):
@@ -197,14 +188,6 @@ def _build_name_map(component_types: dict[Any, mi.Type]) -> dict[Any, str]:
     return {v: k for k, v in names.items()}
 
 
-def _ts_ident(name: str) -> str:
-    """Normalize an arbitrary name to a valid TypeScript identifier."""
-    name = re.sub(r"[^a-zA-Z0-9_$]", "_", name)
-    if name and name[0].isdigit():
-        name = "_" + name
-    return name or "_"
-
-
 def _prop_name(name: str) -> str:
     """Render a property name, quoting it if it's not a valid identifier."""
     if _IDENT_RE.match(name):
@@ -241,11 +224,8 @@ class _SchemaGenerator:
         while isinstance(t, mi.Metadata):
             t = t.type
 
-        # Aliases are referenced by their (normalized) name.
-        if isinstance(t, mi.AliasType):
-            return _ts_ident(t.name)
-
-        # Nameable components are referenced by name.
+        # Nameable components (structs, enums, aliases, ...) are referenced by
+        # name via their `.cls`.
         if hasattr(t, "cls"):
             if name := self.name_map.get(t.cls):
                 return name
