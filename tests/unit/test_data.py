@@ -344,6 +344,74 @@ class TestJsonEncode:
         assert np.array_equal(arr, back)
 
 
+class TestJsonDecode:
+    def test_typed_field_to_tensorhandle(self):
+        class Layer(Struct):
+            name: str
+            weights: Tensor[1, Float32]
+
+        h = TensorHandle(b"\x00\x01\x02\x03", dtype="uint8", shape=(4,))
+        msg = msgspec.json.encode({"name": "w", "weights": h})
+        out = msgspec.json.Decoder(Layer).decode(msg)
+        assert isinstance(out.weights, TensorHandle)
+        assert out.weights.dtype == "uint8"
+        assert out.weights.shape == (4,)
+        assert bytes(out.weights.native) == b"\x00\x01\x02\x03"
+
+    def test_bare_tensorhandle_target(self):
+        h = TensorHandle(b"\x01\x02", dtype="float32", shape=(1,))
+        msg = msgspec.json.encode(h)
+        out = msgspec.json.decode(msg, type=TensorHandle)
+        assert isinstance(out, TensorHandle)
+        assert out.dtype == "float32"
+        assert out.shape == (1,)
+
+    def test_none_dtype_shape(self):
+        h = TensorHandle(b"\x01\x02\x03")
+        out = msgspec.json.decode(msgspec.json.encode(h), type=TensorHandle)
+        assert out.dtype is None
+        assert out.shape is None
+        assert bytes(out.native) == b"\x01\x02\x03"
+
+    def test_dec_tensor_hook(self):
+        np = pytest.importorskip("numpy")
+
+        def to_np(shape, dtype, data):
+            assert isinstance(data, bytes)
+            a = np.frombuffer(data, dtype=np.dtype(dtype))
+            return a.reshape(shape) if shape is not None else a
+
+        arr = np.array([1.5, 2.5, 3.5], dtype=np.float32)
+        msg = msgspec.json.encode(arr)
+        out = msgspec.json.decode(msg, type=Tensor[1, Float32], dec_tensor=to_np)
+        assert isinstance(out, np.ndarray)
+        assert np.array_equal(arr, out)
+
+    def test_numpy_json_roundtrip(self):
+        np = pytest.importorskip("numpy")
+
+        class Layer(Struct):
+            weights: Tensor[2, Float32]
+
+        def to_np(shape, dtype, data):
+            return np.frombuffer(data, dtype=np.dtype(dtype)).reshape(shape)
+
+        arr = np.arange(6, dtype=np.float32).reshape(2, 3)
+        msg = msgspec.json.encode(Layer(weights=arr))
+        out = msgspec.json.Decoder(Layer, dec_tensor=to_np).decode(msg)
+        assert np.array_equal(arr, out.weights)
+
+    def test_dec_tensor_attribute_and_bad_hook(self):
+        def hook(shape, dtype, data):
+            return None
+
+        dec = msgspec.json.Decoder(dec_tensor=hook)
+        assert dec.dec_tensor is hook
+        assert msgspec.json.Decoder().dec_tensor is None
+        with pytest.raises(TypeError, match="dec_tensor must be callable"):
+            msgspec.json.Decoder(dec_tensor=123)
+
+
 def test_decode_no_reference_leak():
     h = TensorHandle(b"x" * 32, dtype="float32", shape=(8,))
     msg = encode(h)

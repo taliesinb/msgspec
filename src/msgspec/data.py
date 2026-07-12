@@ -170,9 +170,9 @@ class Tensor(metaclass=TensorMeta):
 # re-exported here lazily via `__getattr__` so that `_core` can import this
 # module during its own initialization without a circular import.
 #
-# Supported: msgpack encode/decode (memoryview), the `dec_tensor` decode hook,
-# automatic numpy recognition on encode, and JSON encode
-# ({shape, dtype, data:base64}). Still todo: JSON *decode* of tensor objects.
+# Supported: msgpack + JSON encode/decode, the `dec_tensor` decode hook (both
+# formats), automatic numpy recognition on encode, and the self-describing JSON
+# object {"type": "tensor", "shape", "dtype", "data": base64}.
 
 
 def _numpy_to_tensor_handle(arr):
@@ -190,6 +190,24 @@ def _numpy_to_tensor_handle(arr):
         arr = arr.astype(dtype.newbyteorder('='), order='C', copy=False)
         arr = arr if arr.flags['C_CONTIGUOUS'] else arr.copy(order='C')
     return TensorHandle(arr, dtype=name, shape=tuple(arr.shape))
+
+
+def _json_object_to_tensor(obj, dec_tensor):
+    # Convert a decoded JSON tensor object {"type", "shape", "dtype", "data"}
+    # into a TensorHandle (or, if `dec_tensor` is given, the caller's tensor).
+    # Called from the C JSON decoder when the target type is a tensor.
+    import base64
+
+    data = obj.get("data")
+    raw = base64.b64decode(data) if data is not None else b""
+    shape = obj.get("shape")
+    shape = tuple(shape) if shape is not None else None
+    dtype = obj.get("dtype")
+    if dec_tensor is not None:
+        return dec_tensor(shape, dtype, raw)
+    from ._core import TensorHandle
+
+    return TensorHandle(memoryview(raw), dtype, shape)
 
 
 def __getattr__(name):

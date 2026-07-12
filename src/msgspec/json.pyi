@@ -19,6 +19,9 @@ _T = TypeVar("_T")
 _EncHookSig: TypeAlias = Callable[[Any], Any] | None
 _DecHookSig: TypeAlias = Callable[[type, Any], Any] | None
 _FloatHookSig: TypeAlias = Callable[[str], Any] | None
+_DecTensorSig: TypeAlias = (
+    Callable[[tuple[int, ...] | None, str | None, bytes], Any] | None
+)
 _SchemaHookSig: TypeAlias = Callable[[type], dict[str, Any]] | None
 _DecimalFormatSig: TypeAlias = (
     Callable[[decimal.Decimal], Any] | Literal["string", "number"]
@@ -51,6 +54,7 @@ class Decoder(Generic[_T]):
     strict: bool
     dec_hook: _DecHookSig
     float_hook: _FloatHookSig
+    dec_tensor: _DecTensorSig
 
     @overload
     def __init__(
@@ -60,6 +64,7 @@ class Decoder(Generic[_T]):
         strict: bool = True,
         dec_hook: _DecHookSig = None,
         float_hook: _FloatHookSig = None,
+        dec_tensor: _DecTensorSig = None,
     ) -> None: ...
     @overload
     def __init__(
@@ -69,6 +74,7 @@ class Decoder(Generic[_T]):
         strict: bool = True,
         dec_hook: _DecHookSig = None,
         float_hook: _FloatHookSig = None,
+        dec_tensor: _DecTensorSig = None,
     ) -> None: ...
     def decode(self, buf: Buffer | str, /) -> _T: ...
     def decode_lines(self, buf: Buffer | str, /) -> list[_T]: ...
@@ -82,6 +88,7 @@ def decode(
     type: type[_T],
     strict: bool = True,
     dec_hook: _DecHookSig = None,
+    dec_tensor: _DecTensorSig = None,
 ) -> _T: ...
 @overload
 def decode(
@@ -91,6 +98,7 @@ def decode(
     type: Any = ...,
     strict: bool = True,
     dec_hook: _DecHookSig = None,
+    dec_tensor: _DecTensorSig = None,
 ) -> Any: ...
 def encode(
     obj: Any,

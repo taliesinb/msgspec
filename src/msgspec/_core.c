@@ -546,6 +546,7 @@ typedef struct {
     PyObject *Tensor;           /* the base `Tensor` class */
     PyObject *dtype_strings;    /* tuple of dtype name strings, index == dtype code */
     PyObject *numpy_to_handle;  /* data._numpy_to_tensor_handle */
+    PyObject *json_to_tensor;   /* data._json_object_to_tensor */
     PyObject *numpy_ndarray;    /* numpy.ndarray, resolved lazily (NULL if numpy absent) */
     PyObject *str_numpy;        /* the string "numpy" */
     uint8_t gc_cycle;
@@ -17434,6 +17435,7 @@ typedef struct JSONDecoderState {
     TypeNode *type;
     PyObject *dec_hook;
     PyObject *float_hook;
+    PyObject *dec_tensor;
     bool strict;
 
     /* Temporary scratch space */
@@ -17457,6 +17459,7 @@ typedef struct JSONDecoder {
     char strict;
     PyObject *dec_hook;
     PyObject *float_hook;
+    PyObject *dec_tensor;
 } JSONDecoder;
 
 PyDoc_STRVAR(JSONDecoder__doc__,
@@ -17494,15 +17497,16 @@ PyDoc_STRVAR(JSONDecoder__doc__,
 static int
 JSONDecoder_init(JSONDecoder *self, PyObject *args, PyObject *kwds)
 {
-    char *kwlist[] = {"type", "strict", "dec_hook", "float_hook", NULL};
+    char *kwlist[] = {"type", "strict", "dec_hook", "float_hook", "dec_tensor", NULL};
     MsgspecState *st = msgspec_get_global_state();
     PyObject *type = st->typing_any;
     PyObject *dec_hook = NULL;
     PyObject *float_hook = NULL;
+    PyObject *dec_tensor = NULL;
     int strict = 1;
 
     if (!PyArg_ParseTupleAndKeywords(
-        args, kwds, "|O$pOO", kwlist, &type, &strict, &dec_hook, &float_hook)
+        args, kwds, "|O$pOOO", kwlist, &type, &strict, &dec_hook, &float_hook, &dec_tensor)
     ) {
         return -1;
     }
@@ -17533,6 +17537,19 @@ JSONDecoder_init(JSONDecoder *self, PyObject *args, PyObject *kwds)
     }
     self->float_hook = float_hook;
 
+    /* Handle dec_tensor */
+    if (dec_tensor == Py_None) {
+        dec_tensor = NULL;
+    }
+    if (dec_tensor != NULL) {
+        if (!PyCallable_Check(dec_tensor)) {
+            PyErr_SetString(PyExc_TypeError, "dec_tensor must be callable");
+            return -1;
+        }
+        Py_INCREF(dec_tensor);
+    }
+    self->dec_tensor = dec_tensor;
+
     /* Handle strict */
     self->strict = strict;
 
@@ -17553,6 +17570,7 @@ JSONDecoder_traverse(JSONDecoder *self, visitproc visit, void *arg)
     Py_VISIT(self->orig_type);
     Py_VISIT(self->dec_hook);
     Py_VISIT(self->float_hook);
+    Py_VISIT(self->dec_tensor);
     return 0;
 }
 
@@ -17564,6 +17582,7 @@ JSONDecoder_dealloc(JSONDecoder *self)
     Py_XDECREF(self->orig_type);
     Py_XDECREF(self->dec_hook);
     Py_XDECREF(self->float_hook);
+    Py_XDECREF(self->dec_tensor);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -19614,7 +19633,23 @@ static PyObject *
 json_decode_object(
     JSONDecoderState *self, TypeNode *type, PathNode *path
 ) {
-    if (type->types & MS_TYPE_ANY) {
+    if (type->types & MS_TYPE_TENSOR) {
+        /* A `msgspec.data` tensor is encoded to JSON as an object
+         * {"type": "tensor", "shape", "dtype", "data": base64}. Decode it as a
+         * generic dict, then let a Python helper base64-decode `data` and build
+         * a TensorHandle (or call dec_tensor). */
+        MsgspecState *mod = msgspec_get_global_state();
+        TypeNode type_any = {MS_TYPE_ANY};
+        PyObject *obj = json_decode_dict(self, type, &type_any, &type_any, path);
+        if (obj == NULL) return NULL;
+        PyObject *dt = self->dec_tensor == NULL ? Py_None : self->dec_tensor;
+        PyObject *out = PyObject_CallFunctionObjArgs(
+            mod->json_to_tensor, obj, dt, NULL
+        );
+        Py_DECREF(obj);
+        return out;
+    }
+    else if (type->types & MS_TYPE_ANY) {
         TypeNode type_any = {MS_TYPE_ANY};
         return json_decode_dict(self, type, &type_any, &type_any, path);
     }
@@ -20196,6 +20231,7 @@ JSONDecoder_decode(JSONDecoder *self, PyObject *const *args, Py_ssize_t nargs)
         .strict = self->strict,
         .dec_hook = self->dec_hook,
         .float_hook = self->float_hook,
+        .dec_tensor = self->dec_tensor,
         .scratch = NULL,
         .scratch_capacity = 0,
         .scratch_len = 0
@@ -20263,6 +20299,7 @@ JSONDecoder_decode_lines(JSONDecoder *self, PyObject *const *args, Py_ssize_t na
         .strict = self->strict,
         .dec_hook = self->dec_hook,
         .float_hook = self->float_hook,
+        .dec_tensor = self->dec_tensor,
         .scratch = NULL,
         .scratch_capacity = 0,
         .scratch_len = 0
@@ -20338,6 +20375,7 @@ static PyMemberDef JSONDecoder_members[] = {
     {"strict", T_BOOL, offsetof(JSONDecoder, strict), READONLY, "The Decoder strict setting"},
     {"dec_hook", T_OBJECT, offsetof(JSONDecoder, dec_hook), READONLY, "The Decoder dec_hook"},
     {"float_hook", T_OBJECT, offsetof(JSONDecoder, float_hook), READONLY, "The Decoder float_hook"},
+    {"dec_tensor", T_OBJECT, offsetof(JSONDecoder, dec_tensor), READONLY, "The Decoder dec_tensor"},
     {NULL},
 };
 
@@ -20395,6 +20433,7 @@ static PyObject*
 msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
 {
     PyObject *res = NULL, *buf = NULL, *type = NULL, *dec_hook = NULL, *strict_obj = NULL;
+    PyObject *dec_tensor = NULL;
     int strict = 1;
     MsgspecState *mod = msgspec_get_state(self);
 
@@ -20406,6 +20445,7 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
         if ((type = find_keyword(kwnames, args + nargs, mod->str_type)) != NULL) nkwargs--;
         if ((strict_obj = find_keyword(kwnames, args + nargs, mod->str_strict)) != NULL) nkwargs--;
         if ((dec_hook = find_keyword(kwnames, args + nargs, mod->str_dec_hook)) != NULL) nkwargs--;
+        if ((dec_tensor = find_keyword(kwnames, args + nargs, mod->str_dec_tensor)) != NULL) nkwargs--;
         if (nkwargs > 0) {
             PyErr_SetString(
                 PyExc_TypeError,
@@ -20426,6 +20466,17 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
         }
     }
 
+    /* Handle dec_tensor */
+    if (dec_tensor == Py_None) {
+        dec_tensor = NULL;
+    }
+    if (dec_tensor != NULL) {
+        if (!PyCallable_Check(dec_tensor)) {
+            PyErr_SetString(PyExc_TypeError, "dec_tensor must be callable");
+            return NULL;
+        }
+    }
+
     /* Handle strict */
     if (strict_obj != NULL) {
         strict = PyObject_IsTrue(strict_obj);
@@ -20436,6 +20487,7 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
         .strict = strict,
         .dec_hook = dec_hook,
         .float_hook = NULL,
+        .dec_tensor = dec_tensor,
         .scratch = NULL,
         .scratch_capacity = 0,
         .scratch_len = 0
@@ -23145,6 +23197,7 @@ msgspec_clear(PyObject *m)
     Py_CLEAR(st->Tensor);
     Py_CLEAR(st->dtype_strings);
     Py_CLEAR(st->numpy_to_handle);
+    Py_CLEAR(st->json_to_tensor);
     Py_CLEAR(st->numpy_ndarray);
     Py_CLEAR(st->str_numpy);
     return 0;
@@ -23228,6 +23281,7 @@ msgspec_traverse(PyObject *m, visitproc visit, void *arg)
     Py_VISIT(st->Tensor);
     Py_VISIT(st->dtype_strings);
     Py_VISIT(st->numpy_to_handle);
+    Py_VISIT(st->json_to_tensor);
     Py_VISIT(st->numpy_ndarray);
     Py_VISIT(st->str_numpy);
     return 0;
@@ -23439,6 +23493,7 @@ PyInit__core(void)
     SET_REF(TensorMeta, "TensorMeta");
     SET_REF(dtype_strings, "DTYPE_STRINGS");
     SET_REF(numpy_to_handle, "_numpy_to_tensor_handle");
+    SET_REF(json_to_tensor, "_json_object_to_tensor");
     Py_DECREF(temp_module);
 
     temp_module = PyImport_ImportModule("types");
