@@ -179,6 +179,101 @@ byte-compatible with ``msgspec``.
         Layer, tensor_encoder="wrapTensor", tensor_decoder="unwrapTensor"
     )
 
+``wrapTensor``/``unwrapTensor`` are whatever bridges your chosen JS array type
+to a ``TensorHandle``. The example below hosts tensors as `@stdlib/ndarray`_
+values - a numpy-like array that is a *view* over a typed array, so the
+handoff is nearly zero-copy. It is only a reference (msgspec has no dependency
+on it); adapt it to your array library of choice, e.g. `TensorFlow.js`_ tensors
+for GPU acceleration.
+
+Save it alongside the generated codec (or import these two functions into it)
+and pass their names: ``codec(..., tensor_encoder="ndToTensor",
+tensor_decoder="tensorToNd")``.
+
+.. code-block:: typescript
+
+    // Reference adapter between @stdlib/ndarray and the generated TensorHandle.
+    import { array } from "@stdlib/ndarray";
+    import type { ndarray } from "@stdlib/ndarray";
+    import { TensorHandle } from "./codec.ts"; // the generated module
+
+    // msgspec dtype -> { typed-array view, @stdlib dtype name }.
+    const DTYPES: Record<string, { View: any; stdlib: string }> = {
+      uint8:   { View: Uint8Array,     stdlib: "uint8" },
+      uint16:  { View: Uint16Array,    stdlib: "uint16" },
+      uint32:  { View: Uint32Array,    stdlib: "uint32" },
+      uint64:  { View: BigUint64Array, stdlib: "uint64" },
+      int8:    { View: Int8Array,      stdlib: "int8" },
+      int16:   { View: Int16Array,     stdlib: "int16" },
+      int32:   { View: Int32Array,     stdlib: "int32" },
+      int64:   { View: BigInt64Array,  stdlib: "int64" },
+      float32: { View: Float32Array,   stdlib: "float32" },
+      float64: { View: Float64Array,   stdlib: "float64" },
+      bool:    { View: Uint8Array,     stdlib: "uint8" },
+    };
+    const STDLIB_TO_MSGSPEC: Record<string, string> = {
+      uint8: "uint8", uint8c: "uint8", uint16: "uint16", uint32: "uint32",
+      uint64: "uint64", int8: "int8", int16: "int16", int32: "int32",
+      int64: "int64", float32: "float32", float64: "float64", bool: "bool",
+    };
+
+    // decode: TensorHandle -> ndarray (zero-copy view over the decoded bytes)
+    export function tensorToNd(h: TensorHandle): ndarray {
+      const info = DTYPES[h.dtype ?? "uint8"];
+      if (!info) throw new Error(`unsupported tensor dtype: ${h.dtype}`);
+      const buf = new info.View(
+        h.data.buffer,
+        h.data.byteOffset,
+        h.data.byteLength / info.View.BYTES_PER_ELEMENT,
+      );
+      return array(buf, { shape: h.shape ?? [buf.length], dtype: info.stdlib });
+    }
+
+    // encode: ndarray -> TensorHandle
+    export function ndToTensor(x: ndarray): TensorHandle {
+      const dtype = STDLIB_TO_MSGSPEC[x.dtype];
+      if (!dtype) throw new Error(`unsupported ndarray dtype: ${x.dtype}`);
+      const flat = toRowMajor(x); // msgpack packs a C-contiguous buffer
+      const bytes = new Uint8Array(flat.buffer, flat.byteOffset, flat.byteLength);
+      return new TensorHandle(bytes, dtype, x.shape.slice());
+    }
+
+    // A C-contiguous typed array of x's elements: a view when x already owns a
+    // row-major buffer, else a copy (use @stdlib/ndarray/base/assign in practice).
+    function toRowMajor(x: ndarray): ArrayBufferView {
+      if (x.offset === 0 && x.order === "row-major" && isContiguous(x)) {
+        return x.data;
+      }
+      const y = array({ shape: x.shape, dtype: x.dtype, order: "row-major" });
+      const ndim = x.shape.length, idx = new Array(ndim).fill(0);
+      for (let i = 0; i < x.length; i++) {
+        y.iset(i, x.get(...idx));
+        for (let d = ndim - 1; d >= 0; d--) {
+          if (++idx[d] < x.shape[d]) break;
+          idx[d] = 0;
+        }
+      }
+      return y.data;
+    }
+
+    function isContiguous(x: ndarray): boolean {
+      let s = 1;
+      for (let d = x.shape.length - 1; d >= 0; d--) {
+        if (x.strides[d] !== s) return false;
+        s *= x.shape[d];
+      }
+      return true;
+    }
+
+Notes: decoding is genuinely zero-copy (the ``TensorHandle`` bytes are
+reinterpreted and wrapped); encoding is too whenever the ndarray is already
+contiguous. ``int64``/``uint64`` map to ``BigInt64Array``/``BigUint64Array``
+(matching the codec's ``bigint`` handling); ``bool`` is treated as raw
+``uint8`` bytes here; and the raw buffer is native-endian, so only a big-endian
+peer would need a byte-swap.
+
 
 .. _TypeScript: https://www.typescriptlang.org/
 .. _@msgpack/msgpack: https://github.com/msgpack/msgpack-javascript
+.. _@stdlib/ndarray: https://github.com/stdlib-js/ndarray
+.. _TensorFlow.js: https://github.com/tensorflow/tfjs
