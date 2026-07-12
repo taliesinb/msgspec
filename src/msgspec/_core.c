@@ -540,6 +540,10 @@ typedef struct {
 #endif
     PyObject *astimezone;
     PyObject *re_compile;
+    /* msgspec.data tensor support (lazily-usable references grabbed at init) */
+    PyObject *TensorMeta;       /* the metaclass of `Tensor` / `Tensor[...]` */
+    PyObject *Tensor;           /* the base `Tensor` class */
+    PyObject *dtype_strings;    /* tuple of dtype name strings, index == dtype code */
     uint8_t gc_cycle;
 } MsgspecState;
 
@@ -2852,6 +2856,7 @@ AssocList_Sort(AssocList* list) {
 // Despite the fact that `frozendict` was added in 3.15,
 // this type is always defined for order consistency:
 #define MS_TYPE_FROZENDICT          ((1ull << 38) | (1ull << 39))
+#define MS_TYPE_TENSOR              (1ull << 40)
 
 /* Aliases for commonly used types */
 #if PY315_PLUS
@@ -3069,6 +3074,7 @@ static PyTypeObject NamedTupleInfo_Type;
 static PyTypeObject StructInfo_Type;
 static PyTypeObject StructMetaType;
 static PyTypeObject Ext_Type;
+static PyTypeObject TensorHandle_Type;
 static TypeNode* TypeNode_Convert(PyObject *type);
 static PyObject* StructInfo_Convert(PyObject*);
 static PyObject* TypedDictInfo_Convert(PyObject*);
@@ -3527,6 +3533,9 @@ typenode_simple_repr(TypeNode *self) {
     }
     if (self->types & MS_TYPE_EXT) {
         if (!strbuilder_extend_literal(&builder, "ext")) return NULL;
+    }
+    if (self->types & MS_TYPE_TENSOR) {
+        if (!strbuilder_extend_literal(&builder, "tensor")) return NULL;
     }
     if (self->types & (
             MS_TYPE_STRUCT | MS_TYPE_STRUCT_UNION |
@@ -5115,6 +5124,17 @@ typenode_collect_type(TypeNodeCollectState *state, PyObject *obj) {
     }
     else if (t == (PyObject *)(&Ext_Type)) {
         state->types |= MS_TYPE_EXT;
+    }
+    else if (t == (PyObject *)(&TensorHandle_Type)) {
+        state->types |= MS_TYPE_TENSOR;
+    }
+    else if (
+        state->mod->TensorMeta != NULL &&
+        Py_TYPE(t) == (PyTypeObject *)(state->mod->TensorMeta)
+    ) {
+        /* `Tensor` or a `Tensor[...]` specialization; milestone 1 doesn't
+         * validate the dtype/shape against the annotation. */
+        state->types |= MS_TYPE_TENSOR;
     }
     else if (t == (PyObject *)(&Raw_Type)) {
         /* Raw is marked with a typecode of 0, nothing to do */
@@ -9374,6 +9394,122 @@ static PyTypeObject Ext_Type = {
 };
 
 /*************************************************************************
+ * TensorHandle                                                          *
+ *************************************************************************/
+
+/* An opaque wrapper around a packed n-dimensional array. On encode `native`
+ * is any buffer-protocol object (e.g. a numpy array); the encoder takes a
+ * memoryview of it to obtain the raw bytes. On decode `native` is a memoryview
+ * onto a freshly-allocated bytes object holding the decoded payload. */
+typedef struct TensorHandle {
+    PyObject_HEAD
+    PyObject *native;   /* buffer-like (encode) or memoryview (decode) */
+    PyObject *dtype;    /* str or None */
+    PyObject *shape;    /* tuple of ints or None */
+} TensorHandle;
+
+static PyObject *
+TensorHandle_New(PyObject *native, PyObject *dtype, PyObject *shape) {
+    TensorHandle *out = (TensorHandle *)TensorHandle_Type.tp_alloc(&TensorHandle_Type, 0);
+    if (out == NULL)
+        return NULL;
+    Py_INCREF(native);
+    out->native = native;
+    Py_INCREF(dtype);
+    out->dtype = dtype;
+    Py_INCREF(shape);
+    out->shape = shape;
+    return (PyObject *)out;
+}
+
+PyDoc_STRVAR(TensorHandle__doc__,
+"TensorHandle(native, dtype=None, shape=None)\n"
+"--\n"
+"\n"
+"An opaque handle wrapping a packed n-dimensional array for MessagePack\n"
+"encoding.\n"
+"\n"
+"When encoding, `native` may be any object supporting the buffer protocol\n"
+"(e.g. a ``numpy`` array); msgspec takes a ``memoryview`` of it to obtain the\n"
+"raw bytes. When decoding a ``msgspec.data`` tensor, `native` is a\n"
+"``memoryview`` onto the decoded bytes; it is up to the caller to convert it\n"
+"to their array type of choice.\n"
+"\n"
+"Parameters\n"
+"----------\n"
+"native : object\n"
+"    The wrapped array. On encode, any buffer-protocol object.\n"
+"dtype : str or None, optional\n"
+"    The element dtype (e.g. ``'float32'``), or None if unspecified.\n"
+"shape : tuple of int or None, optional\n"
+"    The array shape, or None if unspecified."
+);
+static PyObject *
+TensorHandle_new(PyTypeObject *type, PyObject *args, PyObject *kwargs) {
+    static char *kwlist[] = {"native", "dtype", "shape", NULL};
+    PyObject *native, *dtype = Py_None, *shape = Py_None;
+
+    if (!PyArg_ParseTupleAndKeywords(
+            args, kwargs, "O|OO:TensorHandle", kwlist, &native, &dtype, &shape))
+        return NULL;
+
+    if (dtype != Py_None && !PyUnicode_Check(dtype)) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "dtype must be a str or None, got %.200s",
+            Py_TYPE(dtype)->tp_name
+        );
+        return NULL;
+    }
+    if (shape != Py_None && !PyTuple_Check(shape)) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "shape must be a tuple or None, got %.200s",
+            Py_TYPE(shape)->tp_name
+        );
+        return NULL;
+    }
+    return TensorHandle_New(native, dtype, shape);
+}
+
+static void
+TensorHandle_dealloc(TensorHandle *self)
+{
+    Py_XDECREF(self->native);
+    Py_XDECREF(self->dtype);
+    Py_XDECREF(self->shape);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyObject *
+TensorHandle_repr(TensorHandle *self) {
+    return PyUnicode_FromFormat(
+        "TensorHandle(native=%R, dtype=%R, shape=%R)",
+        self->native, self->dtype, self->shape
+    );
+}
+
+static PyMemberDef TensorHandle_members[] = {
+    {"native", T_OBJECT_EX, offsetof(TensorHandle, native), READONLY, "The wrapped array"},
+    {"dtype", T_OBJECT_EX, offsetof(TensorHandle, dtype), READONLY, "The element dtype, or None"},
+    {"shape", T_OBJECT_EX, offsetof(TensorHandle, shape), READONLY, "The array shape, or None"},
+    {NULL},
+};
+
+static PyTypeObject TensorHandle_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "msgspec.msgpack.TensorHandle",
+    .tp_doc = TensorHandle__doc__,
+    .tp_basicsize = sizeof(TensorHandle),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = TensorHandle_new,
+    .tp_dealloc = (destructor) TensorHandle_dealloc,
+    .tp_repr = (reprfunc) TensorHandle_repr,
+    .tp_members = TensorHandle_members,
+};
+
+/*************************************************************************
  * Dataclass Utilities                                                   *
  *************************************************************************/
 
@@ -13399,6 +13535,120 @@ mpack_encode_struct(EncoderState *self, PyObject *obj)
     return mpack_encode_struct_object(self, struct_type, obj);
 }
 
+/* The reserved MessagePack extension code for `msgspec.data` tensors, and the
+ * version byte leading the ext payload. The payload layout is:
+ *   [version:u8][dtype_code:u8][ndim:u8][shape: ndim * u64 big-endian][raw bytes...]
+ * where dtype_code indexes `mod->dtype_strings` (0xFF == None) and ndim 0xFF
+ * means "shape unspecified". */
+#define MS_EXT_TENSOR_CODE 84  /* ASCII 'T' */
+#define MS_TENSOR_VERSION 1
+
+/* Map a dtype str (or None) to its wire code: 0..N-1, 255 for None, or -1 with
+ * an exception set if unrecognized. */
+static int
+tensor_dtype_to_code(MsgspecState *mod, PyObject *dtype) {
+    if (dtype == Py_None) return 0xFF;
+    Py_ssize_t n = PyTuple_GET_SIZE(mod->dtype_strings);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        int eq = PyObject_RichCompareBool(dtype, PyTuple_GET_ITEM(mod->dtype_strings, i), Py_EQ);
+        if (eq < 0) return -1;
+        if (eq) return (int)i;
+    }
+    PyErr_Format(mod->EncodeError, "Invalid tensor dtype %R", dtype);
+    return -1;
+}
+
+static int
+mpack_encode_tensorhandle(EncoderState *self, PyObject *obj)
+{
+    TensorHandle *th = (TensorHandle *)obj;
+    Py_buffer buffer;
+    buffer.buf = NULL;
+    int status = -1, dtype_code, header_len = 2, shape_is_none;
+    Py_ssize_t ndim = 0, data_len, meta_len, total;
+    char header[6], meta[3];
+
+    if (PyObject_GetBuffer(th->native, &buffer, PyBUF_CONTIG_RO) < 0)
+        return -1;
+    data_len = buffer.len;
+
+    dtype_code = tensor_dtype_to_code(self->mod, th->dtype);
+    if (dtype_code < 0) goto done;
+
+    shape_is_none = (th->shape == Py_None);
+    if (!shape_is_none) {
+        ndim = PyTuple_GET_SIZE(th->shape);
+        if (ndim > 254) {
+            PyErr_SetString(
+                self->mod->EncodeError,
+                "Can't encode a tensor with more than 254 dimensions"
+            );
+            goto done;
+        }
+    }
+
+    meta_len = 3 + (shape_is_none ? 0 : 8 * ndim);
+    total = meta_len + data_len;
+
+    /* ext family header for (MS_EXT_TENSOR_CODE, total) */
+    if (total == 1) {
+        header[0] = MP_FIXEXT1; header[1] = MS_EXT_TENSOR_CODE;
+    }
+    else if (total == 2) {
+        header[0] = MP_FIXEXT2; header[1] = MS_EXT_TENSOR_CODE;
+    }
+    else if (total == 4) {
+        header[0] = MP_FIXEXT4; header[1] = MS_EXT_TENSOR_CODE;
+    }
+    else if (total == 8) {
+        header[0] = MP_FIXEXT8; header[1] = MS_EXT_TENSOR_CODE;
+    }
+    else if (total == 16) {
+        header[0] = MP_FIXEXT16; header[1] = MS_EXT_TENSOR_CODE;
+    }
+    else if (total < (1 << 8)) {
+        header[0] = MP_EXT8; header[1] = (char)total; header[2] = MS_EXT_TENSOR_CODE;
+        header_len = 3;
+    }
+    else if (total < (1 << 16)) {
+        header[0] = MP_EXT16; _msgspec_store16(&header[1], (uint16_t)total);
+        header[3] = MS_EXT_TENSOR_CODE; header_len = 4;
+    }
+    else if (total < (1LL << 32)) {
+        header[0] = MP_EXT32; _msgspec_store32(&header[1], (uint32_t)total);
+        header[5] = MS_EXT_TENSOR_CODE; header_len = 6;
+    }
+    else {
+        PyErr_SetString(
+            self->mod->EncodeError,
+            "Can't encode a tensor with a payload longer than 2**32 - 1 bytes"
+        );
+        goto done;
+    }
+    if (ms_write(self, header, header_len) < 0) goto done;
+
+    meta[0] = (char)MS_TENSOR_VERSION;
+    meta[1] = (char)(unsigned char)dtype_code;
+    meta[2] = shape_is_none ? (char)0xFF : (char)ndim;
+    if (ms_write(self, meta, 3) < 0) goto done;
+
+    if (!shape_is_none) {
+        for (Py_ssize_t i = 0; i < ndim; i++) {
+            unsigned long long v = PyLong_AsUnsignedLongLong(PyTuple_GET_ITEM(th->shape, i));
+            if (v == (unsigned long long)-1 && PyErr_Occurred()) goto done;
+            char axbuf[8];
+            _msgspec_store64(axbuf, v);
+            if (ms_write(self, axbuf, 8) < 0) goto done;
+        }
+    }
+
+    status = data_len > 0 ? ms_write(self, buffer.buf, data_len) : 0;
+done:
+    if (buffer.buf != NULL)
+        PyBuffer_Release(&buffer);
+    return status;
+}
+
 static int
 mpack_encode_ext(EncoderState *self, PyObject *obj)
 {
@@ -13657,6 +13907,9 @@ mpack_encode_uncommon(EncoderState *self, PyTypeObject *type, PyObject *obj)
     }
     else if (type == &Ext_Type) {
         return mpack_encode_ext(self, obj);
+    }
+    else if (type == &TensorHandle_Type) {
+        return mpack_encode_tensorhandle(self, obj);
     }
     else if (type == &Raw_Type) {
         return mpack_encode_raw(self, obj);
@@ -16527,6 +16780,78 @@ mpack_decode_map(
     return ms_validation_error("object", type, path);
 }
 
+/* Decode a `msgspec.data` tensor ext payload into a TensorHandle. `data_buf`
+ * points into the input buffer; the raw tensor bytes are copied into a fresh
+ * bytes object that `native` (a memoryview) then views. */
+static PyObject *
+mpack_decode_tensorhandle(
+    char *data_buf, Py_ssize_t size, PathNode *path
+) {
+    MsgspecState *mod = msgspec_get_global_state();
+    PyObject *dtype = NULL, *shape = NULL, *raw = NULL, *native = NULL, *out = NULL;
+
+    if (size < 3) {
+        return ms_error_with_path("Invalid tensor: truncated header%U", path);
+    }
+    uint8_t version = (uint8_t)data_buf[0];
+    if (version != MS_TENSOR_VERSION) {
+        return ms_error_with_path("Invalid tensor: unsupported version%U", path);
+    }
+    uint8_t dcode = (uint8_t)data_buf[1];
+    uint8_t ndim_byte = (uint8_t)data_buf[2];
+    Py_ssize_t off = 3;
+
+    /* shape */
+    if (ndim_byte == 0xFF) {
+        shape = Py_None;
+        Py_INCREF(shape);
+    }
+    else {
+        Py_ssize_t ndim = ndim_byte;
+        if (size < off + 8 * ndim) {
+            return ms_error_with_path("Invalid tensor: truncated shape%U", path);
+        }
+        shape = PyTuple_New(ndim);
+        if (shape == NULL) return NULL;
+        for (Py_ssize_t i = 0; i < ndim; i++) {
+            uint64_t v = _msgspec_load64(uint64_t, data_buf + off);
+            off += 8;
+            PyObject *ax = PyLong_FromUnsignedLongLong(v);
+            if (ax == NULL) goto done;
+            PyTuple_SET_ITEM(shape, i, ax);
+        }
+    }
+
+    /* dtype */
+    if (dcode == 0xFF) {
+        dtype = Py_None;
+        Py_INCREF(dtype);
+    }
+    else if (dcode < PyTuple_GET_SIZE(mod->dtype_strings)) {
+        dtype = PyTuple_GET_ITEM(mod->dtype_strings, dcode);
+        Py_INCREF(dtype);
+    }
+    else {
+        ms_error_with_path("Invalid tensor: unknown dtype code%U", path);
+        goto done;
+    }
+
+    /* native = memoryview(bytes(raw payload)) */
+    raw = PyBytes_FromStringAndSize(data_buf + off, size - off);
+    if (raw == NULL) goto done;
+    native = PyMemoryView_FromObject(raw);
+    if (native == NULL) goto done;
+
+    out = TensorHandle_New(native, dtype, shape);
+
+done:
+    Py_XDECREF(dtype);
+    Py_XDECREF(shape);
+    Py_XDECREF(raw);
+    Py_XDECREF(native);
+    return out;
+}
+
 static PyObject *
 mpack_decode_ext(
     DecoderState *self, Py_ssize_t size, TypeNode *type, PathNode *path
@@ -16541,7 +16866,10 @@ mpack_decode_ext(
     code = *((int8_t *)(&c_code));
     if (mpack_read(self, &data_buf, size) < 0) return NULL;
 
-    if (type->types & MS_TYPE_DATETIME && code == -1) {
+    if (code == MS_EXT_TENSOR_CODE && (type->types & (MS_TYPE_TENSOR | MS_TYPE_ANY))) {
+        return mpack_decode_tensorhandle(data_buf, size, path);
+    }
+    else if (type->types & MS_TYPE_DATETIME && code == -1) {
         return mpack_decode_datetime(self, data_buf, size, type, path);
     }
     else if (type->types & MS_TYPE_EXT) {
@@ -22694,6 +23022,9 @@ msgspec_clear(PyObject *m)
 #endif
     Py_CLEAR(st->astimezone);
     Py_CLEAR(st->re_compile);
+    Py_CLEAR(st->TensorMeta);
+    Py_CLEAR(st->Tensor);
+    Py_CLEAR(st->dtype_strings);
     return 0;
 }
 
@@ -22771,6 +23102,9 @@ msgspec_traverse(PyObject *m, visitproc visit, void *arg)
     Py_VISIT(st->DecimalType);
     Py_VISIT(st->astimezone);
     Py_VISIT(st->re_compile);
+    Py_VISIT(st->TensorMeta);
+    Py_VISIT(st->Tensor);
+    Py_VISIT(st->dtype_strings);
     return 0;
 }
 
@@ -22835,6 +23169,8 @@ PyInit__core(void)
         return NULL;
     if (PyType_Ready(&Ext_Type) < 0)
         return NULL;
+    if (PyType_Ready(&TensorHandle_Type) < 0)
+        return NULL;
     if (PyType_Ready(&Raw_Type) < 0)
         return NULL;
     if (PyType_Ready(&JSONEncoder_Type) < 0)
@@ -22855,6 +23191,8 @@ PyInit__core(void)
     if (PyModule_AddObjectRef(m, "Meta", (PyObject *)&Meta_Type) < 0)
         return NULL;
     if (PyModule_AddObjectRef(m, "StructConfig", (PyObject *)&StructConfig_Type) < 0)
+        return NULL;
+    if (PyModule_AddObjectRef(m, "TensorHandle", (PyObject *)&TensorHandle_Type) < 0)
         return NULL;
     if (PyModule_AddObjectRef(m, "Ext", (PyObject *)&Ext_Type) < 0)
         return NULL;
@@ -22965,6 +23303,16 @@ PyInit__core(void)
     SET_REF(typing_annotated_alias, "_AnnotatedAlias");
     SET_REF(rebuild, "rebuild");
     SET_REF(convert_generic_alias, "convert_generic_alias");
+    Py_DECREF(temp_module);
+
+    /* msgspec.data tensor support. `data` is a pure-Python submodule that does
+     * not import `_core` at module scope, so importing it here is cycle-free
+     * (same as `msgspec._utils` above). */
+    temp_module = PyImport_ImportModule("msgspec.data");
+    if (temp_module == NULL) return NULL;
+    SET_REF(Tensor, "Tensor");
+    SET_REF(TensorMeta, "TensorMeta");
+    SET_REF(dtype_strings, "DTYPE_STRINGS");
     Py_DECREF(temp_module);
 
     temp_module = PyImport_ImportModule("types");

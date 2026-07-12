@@ -1,6 +1,8 @@
-from typing import TypeAliasType, Any, Literal, cast
+from __future__ import annotations
 
-__all__ = [
+from typing import Any, Literal, TypeAliasType, cast
+
+__all__ = [  # noqa: F822  (TensorHandle is provided via module __getattr__)
     'UInt8',
     'UInt16',
     'UInt32',
@@ -15,6 +17,7 @@ __all__ = [
     'Scalar',
     'DType',
     'Tensor',
+    'TensorHandle',
 ]
 
 type UInt8 = int   # turns into ScalarType('uint8')
@@ -142,9 +145,34 @@ TYPE_CACHE: dict[tuple[Any, ...], TensorMeta] = {}
 # ---
 
 class Tensor(metaclass=TensorMeta):
-    ndims: NumAxes
-    sizes: AxisSizes | None
-    dtype: str
+    ...
+
+# ---
+
+# `TensorHandle` is an opaque handle to a tensor (e.g. a numpy array). Its
+# `native` field is something that supports the buffer protocol / memoryview.
+# Once constructed, msgspec serializes it to a custom MessagePack extension
+# (code 84 / 'T'): a self-describing payload of dtype + shape + raw bytes.
+# On decode, `native` is a memoryview onto a fresh bytes object.
+#
+# It is implemented in the C extension (see `TensorHandle` in `_core.c`) and
+# re-exported here lazily via `__getattr__` so that `_core` can import this
+# module during its own initialization without a circular import.
+#
+# Milestone 2 (not yet implemented):
+# - JSON encoding as a struct {'shape': ..., 'dtype': ..., 'data': base64}.
+# - a `dec_tensor` hook: a function taking (shape, dtype, data: bytes) that
+#   returns the caller's preferred tensor type (e.g. a numpy array).
+# - automatically recognizing numpy arrays and wrapping them as TensorHandle,
+#   without introducing a dependency on numpy.
+
+
+def __getattr__(name):
+    if name == 'TensorHandle':
+        from ._core import TensorHandle
+        return TensorHandle
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # ---
 # examples:

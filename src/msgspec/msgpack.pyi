@@ -30,6 +30,18 @@ class Ext:
     def __init__(self, code: int, data: Buffer) -> None: ...
 
 @final
+class TensorHandle:
+    native: Any
+    dtype: str | None
+    shape: tuple[int, ...] | None
+    def __init__(
+        self,
+        native: Any,
+        dtype: str | None = None,
+        shape: tuple[int, ...] | None = None,
+    ) -> None: ...
+
+@final
 class Decoder(Generic[_T]):
     type: Type[_T]  # needed for mypy, because of the same name
     strict: bool
