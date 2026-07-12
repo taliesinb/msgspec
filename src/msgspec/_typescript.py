@@ -14,6 +14,38 @@ _IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 
 _INDENT = "  "
 
+# TypeScript representation of a `msgspec.data` scalar dtype. 64-bit integers
+# exceed JS number precision so map to `bigint`.
+_DTYPE_TS_SCALAR = {
+    "int8": "number",
+    "int16": "number",
+    "int32": "number",
+    "uint8": "number",
+    "uint16": "number",
+    "uint32": "number",
+    "float32": "number",
+    "float64": "number",
+    "int64": "bigint",
+    "uint64": "bigint",
+    "bool": "boolean",
+}
+
+# TypeScript typed-array for a packed tensor of a given dtype. TS has no bit-
+# packed boolean array, so `bool` uses `Uint8Array`.
+_DTYPE_TS_TENSOR = {
+    "int8": "Int8Array",
+    "int16": "Int16Array",
+    "int32": "Int32Array",
+    "uint8": "Uint8Array",
+    "uint16": "Uint16Array",
+    "uint32": "Uint32Array",
+    "int64": "BigInt64Array",
+    "uint64": "BigUint64Array",
+    "float32": "Float32Array",
+    "float64": "Float64Array",
+    "bool": "Uint8Array",
+}
+
 
 def schema(type: Any) -> str:
     """Generate TypeScript type definitions for a given type.
@@ -271,6 +303,18 @@ class _SchemaGenerator:
             if key not in ("string", "number"):
                 key = "string"
             return f"Record<{key}, {self.to_ref(t.value_type)}>"
+        elif isinstance(t, mi.ScalarType):
+            # A `msgspec.data` scalar; dtype `None` (`Scalar`) is any scalar.
+            if t.dtype is None:
+                return "number | boolean"
+            return _DTYPE_TS_SCALAR[t.dtype]
+        elif isinstance(t, mi.TensorType):
+            # A packed tensor -> a typed array, dispatched on dtype. TypeScript
+            # can't express rank/shape, so ndims/sizes are dropped. dtype `None`
+            # (any) falls back to the generic typed-array view.
+            if t.dtype is None:
+                return "ArrayBufferView"
+            return _DTYPE_TS_TENSOR[t.dtype]
         elif isinstance(t, mi.UnionType):
             return " | ".join(self.to_ref(a) for a in t.types)
         elif isinstance(t, mi.LiteralType):

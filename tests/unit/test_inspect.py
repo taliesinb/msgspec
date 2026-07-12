@@ -282,6 +282,67 @@ def test_typealias_generic_specializations_distinct():
         assert ints != strs
 
 
+def test_data_scalar_aliases():
+    from msgspec import data as md
+
+    # Every dtype alias resolves to a ScalarType with its dtype string.
+    for alias, name in [
+        (md.UInt8, "uint8"),
+        (md.Int64, "int64"),
+        (md.Float32, "float32"),
+        (md.Float64, "float64"),
+        (md.Bool, "bool"),
+    ]:
+        assert mi.type_info(alias) == mi.ScalarType(dtype=name)
+    # The dtype-agnostic `Scalar` resolves to ScalarType(None).
+    assert mi.type_info(md.Scalar) == mi.ScalarType(dtype=None)
+
+
+def test_data_scalar_alias_recognized_regardless_of_aliases_flag():
+    from msgspec import data as md
+
+    # data scalars take precedence over generic alias handling.
+    assert mi.type_info(md.Int32, aliases=True) == mi.ScalarType(dtype="int32")
+
+
+def test_unrelated_alias_not_treated_as_scalar():
+    # A user's own alias that merely resolves to int/float is untouched.
+    Foo = NewType("Foo", int)
+    assert mi.type_info(Foo) == mi.IntType()
+
+
+def test_data_tensor_metas():
+    from msgspec import data as md
+
+    assert mi.type_info(md.Tensor[3, md.Float32]) == mi.TensorType(
+        ndims=3, sizes=None, dtype="float32"
+    )
+    assert mi.type_info(md.Tensor[(3, 3), md.UInt8]) == mi.TensorType(
+        ndims=2, sizes=(3, 3), dtype="uint8"
+    )
+    assert mi.type_info(md.Tensor[5, None]) == mi.TensorType(
+        ndims=5, sizes=None, dtype=None
+    )
+    # Bare Tensor -> fully-unspecified tensor.
+    assert mi.type_info(md.Tensor) == mi.TensorType(
+        ndims=None, sizes=None, dtype=None
+    )
+
+
+def test_data_types_as_struct_fields():
+    from msgspec import data as md
+
+    class Layer(msgspec.Struct):
+        weights: md.Tensor[3, md.Float32]
+        bias: md.Scalar
+        count: md.Int64
+
+    info = mi.type_info(Layer)
+    assert info.fields[0].type == mi.TensorType(ndims=3, sizes=None, dtype="float32")
+    assert info.fields[1].type == mi.ScalarType(dtype=None)
+    assert info.fields[2].type == mi.ScalarType(dtype="int64")
+
+
 def test_final():
     cases = [
         (int, mi.IntType()),

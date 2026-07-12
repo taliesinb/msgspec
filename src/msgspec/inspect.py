@@ -30,6 +30,23 @@ from ._utils import (  # type: ignore
     get_typeddict_info as _get_typeddict_info,
 )
 
+from .data import (
+    Tensor,
+    Scalar,
+    DType,
+    DTYPE_ALIASES,
+    DTYPE_STRINGS,
+    TensorMeta as _TensorMeta,
+    parse_dtype as _parse_dtype,
+)
+
+# Precomputed map from each `msgspec.data` scalar alias to its dtype string
+# (or None for the dtype-agnostic `Scalar`). Membership is used as a cheap
+# fast-path gate in `_Translator.translate`; the values give the `ScalarType`
+# dtype without re-parsing.
+_SCALAR_ALIASES: dict[Any, DType | None] = {a: _parse_dtype(a) for a in DTYPE_ALIASES}
+_SCALAR_ALIASES[Scalar] = None
+
 __all__ = (
     "type_info",
     "multi_type_info",
@@ -69,6 +86,8 @@ __all__ = (
     "NamedTupleType",
     "DataclassType",
     "StructType",
+    "ScalarType",
+    "TensorType",
     "is_struct",
     "is_struct_type",
     "FrozenDictType",
@@ -622,6 +641,17 @@ class StructType(Type):
     forbid_unknown_fields: bool = False
 
 
+
+class ScalarType(Type):
+    dtype: DType | None
+
+
+class TensorType(Type):
+    ndims: int | None                     # None means 'any number of axes'
+    sizes: tuple[int | None, ...] | None  # None means 'any size for this axis', or while sizes is None if size unknown
+    dtype: DType | None                   # None means 'any type for this tensor'
+
+
 def multi_type_info(
     types: Iterable[Any], *, aliases: bool = False
 ) -> tuple[Type, ...]:
@@ -836,6 +866,19 @@ class _Translator:
         return tuple(self.translate(t) for t in self.types)
 
     def translate(self, typ):
+        # Fast-path `msgspec.data` types. Both are gated by a cheap `type(typ)
+        # is ...` identity check so ordinary types pay only a couple of extra
+        # pointer comparisons.
+        tt = type(typ)
+        if tt is _TensorMeta:
+            return TensorType(
+                ndims=getattr(typ, "ndims", None),
+                sizes=getattr(typ, "sizes", None),
+                dtype=getattr(typ, "dtype", None),
+            )
+        if tt is _TypeAliasType and typ in _SCALAR_ALIASES:
+            return ScalarType(_SCALAR_ALIASES[typ])
+
         if self.aliases:
             try:
                 alias = _alias_info(typ)

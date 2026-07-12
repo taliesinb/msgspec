@@ -251,6 +251,75 @@ def test_pep695_type_alias():
     assert "export type Root = Array<Pixels>;" in out
 
 
+@pytest.mark.parametrize(
+    "dtype_alias, expected",
+    [
+        ("UInt8", "number"),
+        ("Int32", "number"),
+        ("Float32", "number"),
+        ("Float64", "number"),
+        ("Int64", "bigint"),
+        ("UInt64", "bigint"),
+        ("Bool", "boolean"),
+    ],
+)
+def test_data_scalar_ts(dtype_alias, expected):
+    from msgspec import data as md
+
+    (root,), components = msgspec.typescript.schema_components([getattr(md, dtype_alias)])
+    assert root == expected
+    assert components == {}
+
+
+def test_data_scalar_any_ts():
+    from msgspec import data as md
+
+    (root,), _ = msgspec.typescript.schema_components([md.Scalar])
+    assert root == "number | boolean"
+
+
+@pytest.mark.parametrize(
+    "shape, dtype_alias, expected",
+    [
+        (3, "Float32", "Float32Array"),
+        ((3, 3), "UInt8", "Uint8Array"),
+        (2, "Int32", "Int32Array"),
+        (4, "Int64", "BigInt64Array"),
+        (1, "UInt64", "BigUint64Array"),
+        (5, "Bool", "Uint8Array"),
+    ],
+)
+def test_data_tensor_ts(shape, dtype_alias, expected):
+    from msgspec import data as md
+
+    tensor = md.Tensor[shape, getattr(md, dtype_alias)]
+    (root,), _ = msgspec.typescript.schema_components([tensor])
+    assert root == expected
+
+
+def test_data_tensor_any_dtype_ts():
+    from msgspec import data as md
+
+    (root,), _ = msgspec.typescript.schema_components([md.Tensor[3, None]])
+    assert root == "ArrayBufferView"
+    (root2,), _ = msgspec.typescript.schema_components([md.Tensor])
+    assert root2 == "ArrayBufferView"
+
+
+def test_data_types_in_struct_ts():
+    from msgspec import data as md
+
+    class Layer(Struct):
+        weights: md.Tensor[3, md.Float32]
+        bias: md.Scalar
+        count: md.Int64
+
+    out = ts(Layer)
+    assert "  weights: Float32Array;" in out
+    assert "  bias: number | boolean;" in out
+    assert "  count: bigint;" in out
+
+
 @py312_plus
 def test_pep695_generic_alias_specializations_distinct():
     from .utils import temp_module
