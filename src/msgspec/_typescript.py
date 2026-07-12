@@ -458,11 +458,13 @@ class _CodecGenerator:
         name_map: dict[Any, str],
         tensor_encoder: str | None = None,
         tensor_decoder: str | None = None,
+        force_int64: bool = False,
     ):
         self.name_map = name_map
         self.schema = _SchemaGenerator(name_map)
         self.tensor_encoder = tensor_encoder
         self.tensor_decoder = tensor_decoder
+        self.force_int64 = force_int64
 
     # -- expression helpers -------------------------------------------------
     def enc(self, t: mi.Type, expr: str) -> str:
@@ -477,9 +479,12 @@ class _CodecGenerator:
                 )
             return f"{self.tensor_encoder}({expr})"
         if isinstance(t, mi.ScalarType):
-            # a `bigint` scalar; @msgpack/msgpack can't encode bigint, so narrow
-            # back to a number for the wire.
-            return f"Number({expr})"
+            # a `bigint` scalar. With force_int64 the msgpack lib encodes the
+            # bigint directly (via useBigInt64); otherwise narrow to a number for
+            # the wire, throwing if that would lose precision.
+            if self.force_int64:
+                return expr
+            return f"_toSafeInt({expr})"
         if isinstance(t, _CODEC_FUNC_TYPES):
             return f"encode{self.name_map[t.cls]}({expr})"
         if isinstance(t, mi.AliasType):
@@ -517,9 +522,9 @@ class _CodecGenerator:
                 )
             return f"{self.tensor_decoder}({expr} as TensorHandle)"
         if isinstance(t, mi.ScalarType):
-            # a `bigint` scalar; the wire value is a number, so convert it into a
-            # real bigint (a bare `as bigint` cast would leave a number behind).
-            return f"BigInt({expr} as number)"
+            # a `bigint` scalar; the wire value is a number (or, with
+            # useBigInt64, already a bigint), so normalize into a real bigint.
+            return f"BigInt({expr} as number | bigint)"
         if isinstance(t, _CODEC_FUNC_TYPES):
             return f"decode{self.name_map[t.cls]}({expr})"
         if isinstance(t, mi.AliasType):
@@ -780,8 +785,48 @@ _extensionCodec.register({
   encode: (input: unknown): Uint8Array | null =>
     input instanceof TensorHandle ? _encodeTensorHandle(input) : null,
   decode: (data: Uint8Array): TensorHandle => _decodeTensorHandle(data),
-});
-const _codecOptions = { extensionCodec: _extensionCodec };'''
+});'''
+
+# Emitted (when `force_int64=False` and the type has a bigint scalar) so encode
+# fails loudly instead of silently narrowing a too-large integer to a lossy
+# `number`.
+_TOSAFEINT_RUNTIME = '''\
+function _toSafeInt(v: bigint | number): number {
+  const n = Number(v);
+  if (!Number.isSafeInteger(n)) {
+    throw new Error(
+      "integer " + v + " is outside the JS safe-integer range; " +
+      "regenerate this codec with force_int64=True"
+    );
+  }
+  return n;
+}'''
+
+
+def _contains_bigint(t: mi.Type, _seen: set | None = None) -> bool:
+    """Whether a `bigint` scalar (int64/uint64) appears anywhere in the tree."""
+    if _seen is None:
+        _seen = set()
+    t = _unwrap(t)
+    if isinstance(t, mi.ScalarType):
+        return _scalar_ts(t) == "bigint"
+    if hasattr(t, "cls"):
+        if t.cls in _seen:
+            return False
+        _seen.add(t.cls)
+    if isinstance(t, (mi.StructType, mi.TypedDictType, mi.DataclassType, mi.NamedTupleType)):
+        return any(_contains_bigint(f.type, _seen) for f in t.fields)
+    if isinstance(t, mi.AliasType):
+        return _contains_bigint(t.value, _seen)
+    if isinstance(t, (mi.ListType, mi.VarTupleType, mi.SetType, mi.FrozenSetType)):
+        return _contains_bigint(t.item_type, _seen)
+    if isinstance(t, mi.TupleType):
+        return any(_contains_bigint(i, _seen) for i in t.item_types)
+    if isinstance(t, (mi.DictType, mi.FrozenDictType)):
+        return _contains_bigint(t.key_type, _seen) or _contains_bigint(t.value_type, _seen)
+    if isinstance(t, mi.UnionType):
+        return any(_contains_bigint(m, _seen) for m in t.types)
+    return False
 
 
 def _str_inner(s: str) -> str:
@@ -799,6 +844,7 @@ def codec(
     *,
     tensor_encoder: str | None = None,
     tensor_decoder: str | None = None,
+    force_int64: bool = False,
 ) -> str:
     """Generate TypeScript type definitions plus MessagePack encoders/decoders
     for a given type.
@@ -821,6 +867,16 @@ def codec(
         call when decoding a tensor. Required if ``type`` contains any tensor
         types. Both functions are assumed to be in scope in the emitted module;
         a ``TensorHandle`` class and the ext-84 ``ExtensionCodec`` are generated.
+    force_int64 : bool, optional
+        How 64-bit integer scalars (``Int``/``Int64``/``UInt64``, which are
+        ``bigint`` in TypeScript) cross the wire. `@msgpack/msgpack` does not
+        encode ``bigint`` by default. If ``False`` (the default), the codec
+        narrows each ``bigint`` to a ``number`` for encoding, throwing if the
+        value exceeds the JS safe-integer range (``2**53``) - so the compact,
+        byte-identical output is only ever produced when it is lossless. If
+        ``True``, the msgpack library's ``useBigInt64`` option is enabled and
+        bigints are encoded directly as 64-bit ints (full precision, but larger,
+        non-compact output).
 
     Returns
     -------
@@ -843,8 +899,12 @@ def codec(
             "the type contains tensor types"
         )
 
+    has_bigint = _contains_bigint(root)
+
     schema_gen = _SchemaGenerator(name_map)
-    codec_gen = _CodecGenerator(name_map, tensor_encoder, tensor_decoder)
+    codec_gen = _CodecGenerator(
+        name_map, tensor_encoder, tensor_decoder, force_int64
+    )
 
     imports = "encode as _mpEncode, decode as _mpDecode"
     if has_tensor:
@@ -853,6 +913,17 @@ def codec(
 
     if has_tensor:
         parts.append(_TENSOR_RUNTIME)
+    if has_bigint and not force_int64:
+        parts.append(_TOSAFEINT_RUNTIME)
+
+    # A shared options object for the msgpack calls, when any is needed.
+    opt_fields = []
+    if has_tensor:
+        opt_fields.append("extensionCodec: _extensionCodec")
+    if force_int64:
+        opt_fields.append("useBigInt64: true")
+    if opt_fields:
+        parts.append(f"const _codecOptions = {{ {', '.join(opt_fields)} }};")
 
     # Type definitions (same as `schema`).
     for cls, t in component_types.items():
@@ -870,7 +941,7 @@ def codec(
             parts.append(codec_gen.dec_def(name_map[cls], t))
 
     # Top-level entry points.
-    opts = ", _codecOptions" if has_tensor else ""
+    opts = ", _codecOptions" if opt_fields else ""
     decode_call = f"_mpDecode(bytes{opts})"
     parts.append(
         f"export function encode(value: {root_ref}): Uint8Array {{\n"

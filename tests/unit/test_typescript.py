@@ -337,10 +337,10 @@ class TestCodec:
 
         out = cc(Foo)
         assert 'a: value["a"],' in out
-        assert 'b: Number(value["b"]),' in out  # encode: bigint -> number
+        assert 'b: _toSafeInt(value["b"]),' in out  # encode: checked bigint->number
         assert 'c: value["c"],' in out
         assert 'a: (o["a"] as number),' in out
-        assert 'b: BigInt(o["b"] as number),' in out  # decode: number -> bigint
+        assert 'b: BigInt(o["b"] as number | bigint),' in out  # decode -> bigint
         assert 'c: (o["c"] as number),' in out
 
     def test_int64_uint64_also_converted(self):
@@ -351,8 +351,41 @@ class TestCodec:
             b: UInt64
 
         out = cc(Foo)
-        assert "Number(value[" in out
+        assert "Number(value[" not in out  # replaced by the checked helper
+        assert '_toSafeInt(value["a"])' in out
         assert "BigInt(o[" in out
+
+    def test_force_int64_false_emits_safe_check(self):
+        from msgspec.data import Int
+
+        class Foo(Struct):
+            b: Int
+
+        out = msgspec.typescript.codec(Foo)  # default force_int64=False
+        assert "function _toSafeInt(" in out
+        assert 'b: _toSafeInt(value["b"]),' in out
+        assert "useBigInt64" not in out
+
+    def test_force_int64_true_uses_usebigint64(self):
+        from msgspec.data import Int
+
+        class Foo(Struct):
+            b: Int
+
+        out = msgspec.typescript.codec(Foo, force_int64=True)
+        assert "_toSafeInt" not in out
+        assert "const _codecOptions = { useBigInt64: true };" in out
+        assert 'b: value["b"],' in out  # bigint passed through directly
+        assert "_mpEncode(encodeFoo(value), _codecOptions)" in out
+        assert "_mpDecode(bytes, _codecOptions)" in out
+
+    def test_no_bigint_no_helper(self):
+        class Foo(Struct):
+            x: int  # plain int -> number, no bigint machinery
+
+        out = cc(Foo)
+        assert "_toSafeInt" not in out
+        assert "useBigInt64" not in out
 
     def test_enum_and_alias_identity(self):
         import enum

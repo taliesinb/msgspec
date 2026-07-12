@@ -36,9 +36,12 @@ aliases, or ``None`` for any).
 ``Int`` and ``Float`` are also useful as *ordinary* field annotations: unlike
 plain ``int``/``float`` (both ``number`` in TypeScript), ``Int`` maps to
 TypeScript ``bigint`` - preserving the integer/float distinction into JS. The
-:doc:`codec <typescript>` converts these soundly (``BigInt(...)`` on decode,
-``Number(...)`` on encode); values above ``2**53`` are subject to JS number
-precision.
+:doc:`codec <typescript>` decodes these into real bigints (``BigInt(...)``). On
+encode, since `@msgpack/msgpack` can't serialize ``bigint`` directly, the codec
+narrows to a ``number`` but *throws* if the value exceeds the JS safe-integer
+range (``2**53``). Pass ``force_int64=True`` to ``codec`` to instead enable the
+msgpack library's ``useBigInt64`` mode and encode full 64-bit ints (larger,
+non-compact output).
 
 These are ordinary :doc:`inspectable <inspect>` types. ``msgspec.inspect``
 reports them as ``ScalarType`` / ``TensorType`` nodes:
