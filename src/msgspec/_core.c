@@ -3068,6 +3068,10 @@ typedef struct {
     int8_t gc;
     int8_t omit_defaults;
     int8_t forbid_unknown_fields;
+    int8_t abstract;                /* 1 if this struct is abstract */
+    PyObject *abstract_config;      /* bool or callable[str]->bool, inherited; or NULL */
+    PyObject *abstract_parents;     /* list[type] of abstract ancestors, or NULL */
+    PyObject *concrete_children;    /* list[type] of concrete descendants (abstract only), or NULL */
 } StructMetaObject;
 
 typedef struct StructInfo {
@@ -4480,6 +4484,30 @@ typenode_collect_struct(TypeNodeCollectState *state, PyObject *obj) {
     return 0;
 }
 
+/* An abstract struct, used as a type, behaves as the union of its concrete
+ * descendants. Expand it by collecting each concrete subclass instead of the
+ * abstract class itself; the normal struct-union machinery then builds a
+ * tagged union (or a single struct, if there's only one concrete subclass). */
+static int
+typenode_collect_abstract_struct(TypeNodeCollectState *state, StructMetaObject *cls) {
+    PyObject *children = cls->concrete_children;
+    Py_ssize_t n = (children == NULL) ? 0 : PyList_GET_SIZE(children);
+    if (n == 0) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "Abstract Struct type '%s' has no concrete subclasses, so it can't "
+            "be used as a type",
+            ((PyTypeObject *)cls)->tp_name
+        );
+        return -1;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        if (typenode_collect_struct(state, PyList_GET_ITEM(children, i)) < 0)
+            return -1;
+    }
+    return 0;
+}
+
 static int
 typenode_collect_typeddict(TypeNodeCollectState *state, PyObject *obj) {
     if (state->typeddict_obj != NULL) {
@@ -5202,6 +5230,9 @@ typenode_collect_type(TypeNodeCollectState *state, PyObject *obj) {
         if (normalize_types_generic_alias(state, &t, origin, args) < 0) {
             out = -1;
         }
+        else if (ms_is_struct_cls(t) && ((StructMetaObject *)t)->abstract) {
+            out = typenode_collect_abstract_struct(state, (StructMetaObject *)t);
+        }
         else {
             out = typenode_collect_struct(state, t);
         }
@@ -5814,6 +5845,7 @@ typedef struct {
     PyObject *tag;
     PyObject *tag_field;
     PyObject *tag_value;
+    PyObject *abstract_parents;  /* list[type] or NULL */
     Py_ssize_t *offsets;
     Py_ssize_t nkwonly;
     Py_ssize_t n_trailing_defaults;
@@ -5821,6 +5853,8 @@ typedef struct {
     PyObject *name;
     PyObject *temp_tag_field;
     PyObject *temp_tag;
+    PyObject *temp_abstract;  /* borrowed: kwarg or inherited config (bool/callable) */
+    int abstract;             /* resolved 0/1, or -1 if unset */
     PyObject *rename;
     int omit_defaults;
     int forbid_unknown_fields;
@@ -5917,6 +5951,39 @@ structmeta_collect_base(StructMetaInfo *info, MsgspecState *mod, PyObject *base)
     }
     if (st_type->rename != NULL) {
         info->rename = st_type->rename;
+    }
+    /* Inherit abstract config from the base unless explicitly set on this
+     * class. Only a *callable* config is inherited (and re-evaluated per
+     * subclass name); a plain `abstract=True`/`False` bool applies solely to
+     * the class it was declared on, so children flip back to concrete. */
+    if (
+        info->temp_abstract == NULL
+        && st_type->abstract_config != NULL
+        && PyCallable_Check(st_type->abstract_config)
+    ) {
+        info->temp_abstract = st_type->abstract_config;
+    }
+    /* Build this class's abstract ancestor list: the base's abstract ancestors,
+     * plus the base itself if it is abstract. */
+    if (st_type->abstract_parents != NULL || st_type->abstract) {
+        PyObject *parents = PyList_New(0);
+        if (parents == NULL) return -1;
+        if (st_type->abstract_parents != NULL) {
+            Py_ssize_t n = PyList_GET_SIZE(st_type->abstract_parents);
+            for (Py_ssize_t i = 0; i < n; i++) {
+                if (PyList_Append(parents, PyList_GET_ITEM(st_type->abstract_parents, i)) < 0) {
+                    Py_DECREF(parents);
+                    return -1;
+                }
+            }
+        }
+        if (st_type->abstract) {
+            if (PyList_Append(parents, base) < 0) {
+                Py_DECREF(parents);
+                return -1;
+            }
+        }
+        Py_XSETREF(info->abstract_parents, parents);
     }
     info->frozen = STRUCT_MERGE_OPTIONS(info->frozen, st_type->frozen);
     info->eq = STRUCT_MERGE_OPTIONS(info->eq, st_type->eq);
@@ -6593,7 +6660,8 @@ StructMeta_new_inner(
     int arg_omit_defaults, int arg_forbid_unknown_fields,
     int arg_frozen, int arg_eq, int arg_order, bool arg_kw_only,
     int arg_repr_omit_defaults, int arg_array_like,
-    int arg_gc, int arg_weakref, int arg_dict, int arg_cache_hash
+    int arg_gc, int arg_weakref, int arg_dict, int arg_cache_hash,
+    PyObject *arg_abstract
 ) {
     StructMetaObject *cls = NULL;
     MsgspecState *mod = msgspec_get_global_state();
@@ -6615,12 +6683,15 @@ StructMeta_new_inner(
         .tag = NULL,
         .tag_field = NULL,
         .tag_value = NULL,
+        .abstract_parents = NULL,
         .offsets = NULL,
         .nkwonly = 0,
         .n_trailing_defaults = 0,
         .name = name,
         .temp_tag_field = NULL,
         .temp_tag = NULL,
+        .temp_abstract = NULL,
+        .abstract = -1,
         .rename = NULL,
         .omit_defaults = -1,
         .forbid_unknown_fields = -1,
@@ -6676,6 +6747,38 @@ StructMeta_new_inner(
     info.gc = STRUCT_MERGE_OPTIONS(info.gc, arg_gc);
     info.omit_defaults = STRUCT_MERGE_OPTIONS(info.omit_defaults, arg_omit_defaults);
     info.forbid_unknown_fields = STRUCT_MERGE_OPTIONS(info.forbid_unknown_fields, arg_forbid_unknown_fields);
+
+    /* Resolve the abstract config (a bool or callable[str]->bool). An explicit
+     * `abstract=` on this class overrides any inherited config; a callable is
+     * re-evaluated against this class's own name. */
+    if (arg_abstract != NULL) {
+        info.temp_abstract = arg_abstract;
+    }
+    if (info.temp_abstract == NULL) {
+        info.abstract = 0;
+    }
+    else if (PyBool_Check(info.temp_abstract)) {
+        info.abstract = (info.temp_abstract == Py_True);
+    }
+    else if (PyCallable_Check(info.temp_abstract)) {
+        PyObject *r = PyObject_CallOneArg(info.temp_abstract, name);
+        if (r == NULL) goto cleanup;
+        if (!PyBool_Check(r)) {
+            Py_DECREF(r);
+            PyErr_SetString(
+                PyExc_TypeError, "Struct `abstract` callable must return a bool"
+            );
+            goto cleanup;
+        }
+        info.abstract = (r == Py_True);
+        Py_DECREF(r);
+    }
+    else {
+        PyErr_SetString(
+            PyExc_TypeError, "Struct `abstract` must be a bool or a callable"
+        );
+        goto cleanup;
+    }
 
     if (info.eq == OPT_FALSE && info.order == OPT_TRUE) {
         PyErr_SetString(PyExc_ValueError, "Cannot set eq=False and order=True");
@@ -6797,6 +6900,30 @@ StructMeta_new_inner(
     cls->omit_defaults = info.omit_defaults;
     cls->forbid_unknown_fields = info.forbid_unknown_fields;
 
+    /* Abstract config */
+    cls->abstract = info.abstract;
+    Py_XINCREF(info.temp_abstract);
+    cls->abstract_config = info.temp_abstract;
+    Py_XINCREF(info.abstract_parents);
+    cls->abstract_parents = info.abstract_parents;
+    if (info.abstract) {
+        /* Abstract classes accumulate their concrete descendants. */
+        cls->concrete_children = PyList_New(0);
+        if (cls->concrete_children == NULL) goto cleanup;
+    }
+    else if (info.abstract_parents != NULL) {
+        /* Register this concrete class with each abstract ancestor. */
+        Py_ssize_t n = PyList_GET_SIZE(info.abstract_parents);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            StructMetaObject *anc =
+                (StructMetaObject *)PyList_GET_ITEM(info.abstract_parents, i);
+            if (anc->concrete_children != NULL) {
+                if (PyList_Append(anc->concrete_children, (PyObject *)cls) < 0)
+                    goto cleanup;
+            }
+        }
+    }
+
     ok = true;
 
 cleanup:
@@ -6815,6 +6942,7 @@ cleanup:
     Py_XDECREF(info.tag);
     Py_XDECREF(info.tag_field);
     Py_XDECREF(info.tag_value);
+    Py_XDECREF(info.abstract_parents);
     if (!ok) {
         if (info.offsets != NULL) {
             PyMem_Free(info.offsets);
@@ -6834,6 +6962,7 @@ StructMeta_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
     int arg_frozen = -1, arg_eq = -1, arg_order = -1, arg_repr_omit_defaults = -1;
     int arg_array_like = -1, arg_gc = -1, arg_weakref = -1, arg_dict = -1;
     int arg_kw_only = 0, arg_cache_hash = -1;
+    PyObject *arg_abstract = NULL;
 
     char *kwlist[] = {
         "name", "bases", "dict",
@@ -6842,18 +6971,20 @@ StructMeta_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
         "frozen", "eq", "order", "kw_only",
         "repr_omit_defaults", "array_like",
         "gc", "weakref", "dict", "cache_hash",
+        "abstract",
         NULL
     };
 
     /* Parse arguments: (name, bases, dict) */
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "UO!O!|$OOOpppppppppppp:StructMeta.__new__", kwlist,
+            args, kwargs, "UO!O!|$OOOppppppppppppO:StructMeta.__new__", kwlist,
             &name, &PyTuple_Type, &bases, &PyDict_Type, &namespace,
             &arg_tag_field, &arg_tag, &arg_rename,
             &arg_omit_defaults, &arg_forbid_unknown_fields,
             &arg_frozen, &arg_eq, &arg_order, &arg_kw_only,
             &arg_repr_omit_defaults, &arg_array_like,
-            &arg_gc, &arg_weakref, &arg_dict, &arg_cache_hash
+            &arg_gc, &arg_weakref, &arg_dict, &arg_cache_hash,
+            &arg_abstract
         )
     )
         return NULL;
@@ -6864,7 +6995,8 @@ StructMeta_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
         arg_omit_defaults, arg_forbid_unknown_fields,
         arg_frozen, arg_eq, arg_order, arg_kw_only,
         arg_repr_omit_defaults, arg_array_like,
-        arg_gc, arg_weakref, arg_dict, arg_cache_hash
+        arg_gc, arg_weakref, arg_dict, arg_cache_hash,
+        arg_abstract
     );
 }
 
@@ -6928,6 +7060,7 @@ msgspec_defstruct(PyObject *self, PyObject *args, PyObject *kwargs)
     int arg_frozen = -1, arg_eq = -1, arg_order = -1, arg_kw_only = 0;
     int arg_repr_omit_defaults = -1, arg_array_like = -1;
     int arg_gc = -1, arg_weakref = -1, arg_dict = -1, arg_cache_hash = -1;
+    PyObject *arg_abstract = NULL;
 
     char *kwlist[] = {
         "name", "fields", "bases", "module", "namespace",
@@ -6936,18 +7069,20 @@ msgspec_defstruct(PyObject *self, PyObject *args, PyObject *kwargs)
         "frozen", "eq", "order", "kw_only",
         "repr_omit_defaults", "array_like",
         "gc", "weakref", "dict", "cache_hash",
+        "abstract",
         NULL
     };
 
     /* Parse arguments: (name, bases, dict) */
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "UO|$OOOOOOpppppppppppp:defstruct", kwlist,
+            args, kwargs, "UO|$OOOOOOppppppppppppO:defstruct", kwlist,
             &name, &fields, &bases, &module, &namespace,
             &arg_tag_field, &arg_tag, &arg_rename,
             &arg_omit_defaults, &arg_forbid_unknown_fields,
             &arg_frozen, &arg_eq, &arg_order, &arg_kw_only,
             &arg_repr_omit_defaults, &arg_array_like,
-            &arg_gc, &arg_weakref, &arg_dict, &arg_cache_hash)
+            &arg_gc, &arg_weakref, &arg_dict, &arg_cache_hash,
+            &arg_abstract)
     )
         return NULL;
 
@@ -7035,7 +7170,8 @@ msgspec_defstruct(PyObject *self, PyObject *args, PyObject *kwargs)
         arg_omit_defaults, arg_forbid_unknown_fields,
         arg_frozen, arg_eq, arg_order, arg_kw_only,
         arg_repr_omit_defaults, arg_array_like,
-        arg_gc, arg_weakref, arg_dict, arg_cache_hash
+        arg_gc, arg_weakref, arg_dict, arg_cache_hash,
+        arg_abstract
     );
 
 cleanup:
@@ -7225,6 +7361,9 @@ StructMeta_traverse(StructMetaObject *self, visitproc visit, void *arg)
     Py_VISIT(self->rename);  /* May be a function */
     Py_VISIT(self->post_init);
     Py_VISIT(self->struct_info);
+    Py_VISIT(self->abstract_config);  /* May be a function */
+    Py_VISIT(self->abstract_parents);
+    Py_VISIT(self->concrete_children);
     return PyType_Type.tp_traverse((PyObject *)self, visit, arg);
 }
 
@@ -7244,6 +7383,9 @@ StructMeta_clear(StructMetaObject *self)
     Py_CLEAR(self->post_init);
     Py_CLEAR(self->struct_info);
     Py_CLEAR(self->match_args);
+    Py_CLEAR(self->abstract_config);
+    Py_CLEAR(self->abstract_parents);
+    Py_CLEAR(self->concrete_children);
     if (self->struct_offsets != NULL) {
         PyMem_Free(self->struct_offsets);
         self->struct_offsets = NULL;
@@ -7457,6 +7599,29 @@ StructConfig_tag(StructConfig *self, void *closure)
     return out;
 }
 
+static PyObject*
+StructConfig_abstract(StructConfig *self, void *closure)
+{
+    if (self->st_type->abstract) { Py_RETURN_TRUE; }
+    else { Py_RETURN_FALSE; }
+}
+
+static PyObject*
+StructConfig_abstract_parents(StructConfig *self, void *closure)
+{
+    PyObject *out = self->st_type->abstract_parents;
+    if (out == NULL) Py_RETURN_NONE;
+    return PyList_GetSlice(out, 0, PyList_GET_SIZE(out));
+}
+
+static PyObject*
+StructConfig_concrete_children(StructConfig *self, void *closure)
+{
+    PyObject *out = self->st_type->concrete_children;
+    if (out == NULL) Py_RETURN_NONE;
+    return PyList_GetSlice(out, 0, PyList_GET_SIZE(out));
+}
+
 static PyGetSetDef StructConfig_getset[] = {
     {"frozen", (getter) StructConfig_frozen, NULL, NULL, NULL},
     {"eq", (getter) StructConfig_eq, NULL, NULL, NULL},
@@ -7471,6 +7636,9 @@ static PyGetSetDef StructConfig_getset[] = {
     {"forbid_unknown_fields", (getter) StructConfig_forbid_unknown_fields, NULL, NULL, NULL},
     {"tag", (getter) StructConfig_tag, NULL, NULL, NULL},
     {"tag_field", (getter) StructConfig_tag_field, NULL, NULL, NULL},
+    {"abstract", (getter) StructConfig_abstract, NULL, NULL, NULL},
+    {"abstract_parents", (getter) StructConfig_abstract_parents, NULL, NULL, NULL},
+    {"concrete_children", (getter) StructConfig_concrete_children, NULL, NULL, NULL},
     {NULL},
 };
 
@@ -7788,6 +7956,14 @@ Struct_build_abstract_error(PyTypeObject *cls) {
 
 static PyObject *
 Struct_vectorcall(PyTypeObject *cls, PyObject *const *args, size_t nargsf, PyObject *kwnames) {
+    if (MS_UNLIKELY(((StructMetaObject *)cls)->abstract)) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "Can't instantiate abstract Struct type %s",
+            cls->tp_name
+        );
+        return NULL;
+    }
     if (MS_UNLIKELY(cls->tp_flags & Py_TPFLAGS_IS_ABSTRACT)) {
         Struct_build_abstract_error(cls);
         return NULL;
@@ -17577,7 +17753,7 @@ msgspec_msgpack_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
     if (type == NULL || type == mod->typing_any) {
         state.type = &typenode_any;
     }
-    else if (ms_is_struct_cls(type)) {
+    else if (ms_is_struct_cls(type) && !((StructMetaObject *)type)->abstract) {
         PyObject *info = StructInfo_Convert(type);
         if (info == NULL) return NULL;
         bool array_like = ((StructMetaObject *)type)->array_like == OPT_TRUE;
@@ -20689,7 +20865,7 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
     if (type == NULL || type == mod->typing_any) {
         state.type = &typenode_any;
     }
-    else if (ms_is_struct_cls(type)) {
+    else if (ms_is_struct_cls(type) && !((StructMetaObject *)type)->abstract) {
         PyObject *info = StructInfo_Convert(type);
         if (info == NULL) return NULL;
         bool array_like = ((StructMetaObject *)type)->array_like == OPT_TRUE;
@@ -23237,7 +23413,7 @@ msgspec_convert(PyObject *self, PyObject *args, PyObject *kwargs)
     state.dec_hook = dec_hook;
 
     /* Avoid allocating a new TypeNode for struct types */
-    if (ms_is_struct_cls(pytype)) {
+    if (ms_is_struct_cls(pytype) && !((StructMetaObject *)pytype)->abstract) {
         PyObject *info = StructInfo_Convert(pytype);
         if (info == NULL) return NULL;
         bool array_like = ((StructMetaObject *)pytype)->array_like == OPT_TRUE;

@@ -181,6 +181,7 @@ Inspect
 .. autoclass:: NamedTupleType
 .. autoclass:: DataclassType
 .. autoclass:: StructType
+.. autoclass:: AbstractStructType
 
 
 Exceptions

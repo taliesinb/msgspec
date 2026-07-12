@@ -167,6 +167,24 @@ def check_struct_forbid_unknown_fields() -> None:
     assert_type(t.y, str)
 
 
+def check_struct_abstract() -> None:
+    class Base(msgspec.Struct, abstract=True, tag_field="kind"):
+        pass
+
+    class TestBool(Base, tag="test"):
+        x: int
+
+    class Callable(msgspec.Struct, abstract=lambda name: name.startswith("Abstract")):
+        pass
+
+    t = TestBool(1)
+    assert_type(t, TestBool)
+    assert_type(t.x, int)
+
+    cfg = Base.__struct_config__
+    assert_type(cfg.abstract, bool)
+
+
 def check_struct_rename() -> None:
     class TestLower(msgspec.Struct, rename="lower"):
         x: int

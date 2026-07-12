@@ -604,6 +604,63 @@ for all struct types you wish to tag.
     Get(key='my key')
 
 
+.. _abstract:
+
+Abstract Structs
+----------------
+
+A tagged union like ``Get | Put`` above has to be spelled out everywhere it's
+used. If you'd rather refer to the whole family by a single name, mark the base
+class ``abstract=True``. An abstract struct can't be instantiated or decoded
+itself - but **used as a type it behaves exactly like the tagged union of its
+concrete descendants**:
+
+.. code-block:: python
+
+    >>> import msgspec
+
+    >>> class Command(msgspec.Struct, tag_field="op", tag=str.lower, abstract=True):
+    ...     pass
+
+    >>> class Get(Command):
+    ...     key: str
+
+    >>> class Put(Command):
+    ...     key: str
+    ...     val: str
+
+    >>> # `Command` decodes as `Get | Put`, dispatched on the "op" tag
+    ... dec = msgspec.json.Decoder(Command)
+
+    >>> dec.decode(b'{"op": "put", "key": "my key", "val": "my val"}')
+    Put(key='my key', val='my val')
+
+    >>> # The abstract base can't be instantiated directly
+    ... Command()
+    Traceback (most recent call last):
+        ...
+    TypeError: Can't instantiate abstract Struct type Command
+
+The concrete descendants must form a valid :ref:`tagged union <struct-tagged-unions>`
+(the example above tags them via ``tag``/``tag_field`` on the base). This works
+everywhere a type is accepted - nested fields, `msgspec.json.schema`,
+`msgspec.typescript`, and `msgspec.inspect` all treat ``Command`` as the union.
+
+The ``abstract`` kwarg accepts a bool or a callable:
+
+- ``abstract=True`` marks **only** the class it's written on. Subclasses are
+  concrete by default (so you don't have to write ``abstract=False`` on every
+  leaf), unless they set ``abstract=True`` themselves.
+- ``abstract=<callable>`` is inherited by subclasses and re-evaluated against
+  each subclass's name, letting a naming convention decide. For example
+  ``abstract=lambda name: name.startswith("Abstract")`` makes every class whose
+  name starts with ``Abstract`` abstract and the rest concrete.
+
+The lineage is available on `StructConfig <msgspec.structs.StructConfig>` via
+``abstract``, ``abstract_parents`` (the abstract ancestors of a class), and
+``concrete_children`` (the concrete descendants of an abstract class).
+
+
 .. _omit_defaults:
 
 Omitting Default Values

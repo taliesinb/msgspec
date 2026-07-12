@@ -130,7 +130,14 @@ def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type
     components: dict[Any, mi.Type] = {}
 
     def collect(t):
-        if isinstance(t, mi.AliasType):
+        if isinstance(t, mi.AbstractStructType):
+            # An abstract struct is emitted as a named union alias
+            # (`type Foo = Bar | Baz`), so keep its name as a component and
+            # also collect its concrete descendants.
+            if t.cls not in components:
+                components[t.cls] = t
+                collect(t.concrete_union_type)
+        elif isinstance(t, mi.AliasType):
             if t.cls not in components:
                 components[t.cls] = t
                 collect(t.value)
@@ -262,7 +269,10 @@ class _SchemaGenerator:
             if name := self.name_map.get(t.cls):
                 return name
 
-        if isinstance(t, (mi.AnyType, mi.RawType)):
+        if isinstance(t, mi.AbstractStructType):
+            # An abstract struct behaves as the union of its concretes.
+            return self.to_ref(t.concrete_union_type)
+        elif isinstance(t, (mi.AnyType, mi.RawType)):
             return "any"
         elif isinstance(t, mi.NoneType):
             return "null"
@@ -333,7 +343,10 @@ class _SchemaGenerator:
         shape of array-like structs and named-tuples is handled by the codec,
         not the schema.
         """
-        if isinstance(t, mi.AliasType):
+        if isinstance(t, mi.AbstractStructType):
+            # A named alias for the tagged union of its concrete descendants.
+            return f"export type {name} = {self.to_ref(t.concrete_union_type)};"
+        elif isinstance(t, mi.AliasType):
             return f"export type {name} = {self.to_ref(t.value)};"
         elif isinstance(t, mi.EnumType):
             return self._enum_def(name, t)
@@ -443,6 +456,9 @@ def _is_identity(t: mi.Type) -> bool:
 def _unwrap(t: mi.Type) -> mi.Type:
     while isinstance(t, mi.Metadata):
         t = t.type
+    if isinstance(t, mi.AbstractStructType):
+        # An abstract struct behaves as the union of its concrete descendants.
+        return _unwrap(t.concrete_union_type)
     return t
 
 
@@ -556,6 +572,15 @@ class _CodecGenerator:
     # -- unions -------------------------------------------------------------
     def _partition_union(self, t: mi.UnionType):
         members = [_unwrap(m) for m in t.types]
+        # An abstract-struct member unwraps to a nested union; flatten so its
+        # concretes participate in tag dispatch directly.
+        flat: list = []
+        for m in members:
+            if isinstance(m, mi.UnionType):
+                flat.extend(_unwrap(x) for x in m.types)
+            else:
+                flat.append(m)
+        members = flat
         has_none = any(isinstance(m, mi.NoneType) for m in members)
         tagged = [
             m
@@ -934,9 +959,12 @@ def codec(
         parts.append(f"export type Root = {root_ref};")
         root_ref = "Root"
 
-    # Per-component encode/decode functions.
+    # Per-component encode/decode functions. An abstract struct is a union
+    # alias, not an object - its codec dispatch is inlined at use sites.
     for cls, t in component_types.items():
-        if isinstance(t, _CODEC_FUNC_TYPES):
+        if isinstance(t, _CODEC_FUNC_TYPES) and not isinstance(
+            t, mi.AbstractStructType
+        ):
             parts.append(codec_gen.enc_def(name_map[cls], t))
             parts.append(codec_gen.dec_def(name_map[cls], t))
 

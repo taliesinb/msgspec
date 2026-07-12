@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import decimal
 import enum
+import functools
 import sys
 import uuid
 from collections.abc import Iterable
@@ -93,6 +94,7 @@ __all__ = (
     "NamedTupleType",
     "DataclassType",
     "StructType",
+    "AbstractStructType",
     "ScalarType",
     "TensorType",
     "is_struct",
@@ -638,6 +640,10 @@ class StructType(Type):
     forbid_unknown_fields: bool, optional
         If ``False`` (the default) unknown fields are ignored when decoding. If
         ``True`` any unknown fields will result in an error.
+    abstract: bool, optional
+        Whether the struct was defined with ``abstract=True``. An abstract
+        struct behaves, when used as a type, as the tagged union of its
+        concrete descendants (see `AbstractStructType`).
     """
 
     cls: type[msgspec.Struct]
@@ -646,7 +652,29 @@ class StructType(Type):
     tag: str | int | None = None
     array_like: bool = False
     forbid_unknown_fields: bool = False
+    abstract: bool = False
 
+
+class AbstractStructType(StructType, dict=True):
+    """A type corresponding to an abstract `msgspec.Struct` type.
+
+    An abstract struct (defined with ``abstract=True``) is not itself decoded;
+    used as a type it behaves identically to the tagged union of its concrete
+    descendants. `concrete_classes` and `concrete_union_type` expose that
+    union. The ``abstract`` field is always ``True``.
+    """
+
+    abstract: bool = True
+
+    @functools.cached_property
+    def concrete_classes(self) -> tuple[type[msgspec.Struct], ...]:
+        """The concrete descendant classes this abstract struct expands to."""
+        return tuple(self.cls.__struct_config__.concrete_children or ())
+
+    @functools.cached_property
+    def concrete_union_type(self) -> UnionType:
+        """The `UnionType` this abstract struct is equivalent to as a type."""
+        return UnionType(tuple(type_info(c) for c in self.concrete_classes))
 
 
 class ScalarType(Type):
@@ -1061,13 +1089,15 @@ class _Translator:
             if cls in self.cache:
                 return self.cache[cls]
             config = t.__struct_config__
-            self.cache[cls] = out = StructType(
+            struct_cls = AbstractStructType if config.abstract else StructType
+            self.cache[cls] = out = struct_cls(
                 cls,
                 (),
                 tag_field=config.tag_field,
                 tag=config.tag,
                 array_like=config.array_like,
                 forbid_unknown_fields=config.forbid_unknown_fields,
+                abstract=config.abstract,
             )
 
             hints = self._get_class_annotations(cls)

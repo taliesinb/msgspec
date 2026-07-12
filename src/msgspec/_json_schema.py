@@ -126,7 +126,11 @@ def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type
     components = {}
 
     def collect(t):
-        if isinstance(
+        if isinstance(t, mi.AbstractStructType):
+            # An abstract struct is transparent - it behaves as the union of
+            # its concrete descendants, so collect those instead.
+            collect(t.concrete_union_type)
+        elif isinstance(
             t, (mi.StructType, mi.TypedDictType, mi.DataclassType, mi.NamedTupleType)
         ):
             if t.cls not in components:
@@ -237,7 +241,10 @@ class _SchemaGenerator:
                 schema["$ref"] = self.ref_template.format(name=name)
                 return schema
 
-        if isinstance(t, (mi.AnyType, mi.RawType)):
+        if isinstance(t, mi.AbstractStructType):
+            # An abstract struct renders as the tagged union of its concretes.
+            schema = mi._merge_json(schema, self.to_schema(t.concrete_union_type))
+        elif isinstance(t, (mi.AnyType, mi.RawType)):
             pass
         elif isinstance(t, mi.NoneType):
             schema["type"] = "null"

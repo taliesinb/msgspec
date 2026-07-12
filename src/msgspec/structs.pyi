@@ -24,6 +24,9 @@ class StructConfig:
     cache_hash: bool
     tag: str | int | None
     tag_field: str | None
+    abstract: bool
+    abstract_parents: list[type[Struct]] | None
+    concrete_children: list[type[Struct]] | None
 
 class FieldInfo(Struct):
     name: str

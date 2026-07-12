@@ -62,6 +62,7 @@ class StructMeta(type):
         weakref: bool = False,
         dict: bool = False,
         cache_hash: bool = False,
+        abstract: bool | Callable[[str], bool] = False,
     ) -> _SM: ...
 
 _T = TypeVar("_T")
@@ -117,6 +118,7 @@ class Struct(metaclass=StructMeta):
         weakref: bool = False,
         dict: bool = False,
         cache_hash: bool = False,
+        abstract: bool | Callable[[str], bool] = False,
     ) -> None: ...
     def __rich_repr__(self) -> list[tuple[str, Any]]: ...
     def __replace__(self, **changes: Any) -> Self: ...
@@ -148,6 +150,7 @@ def defstruct(
     weakref: bool = False,
     dict: bool = False,
     cache_hash: bool = False,
+    abstract: bool | Callable[[str], bool] = False,
 ) -> type[Struct]: ...
 
 # Lie and say `Raw` is a subclass of `bytes`, so mypy will accept it in most
