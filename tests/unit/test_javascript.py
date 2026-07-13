@@ -279,6 +279,44 @@ def test_node_json_format_compat(tmp_path):
 
 
 @needs_node
+def test_node_scalar_container_union(tmp_path):
+    """A union mixing a scalar with a container (e.g. `str | tuple`) dispatches on
+    the JS runtime shape (encode) and the msgpack tag / JSON shape (decode)."""
+
+    class Doc(Struct):
+        end: Union[str, tuple[str, int]]
+
+    cases = [Doc(end="root"), Doc(end=("a", 3))]
+    ref = [
+        {
+            "mp": msgspec.msgpack.encode(c, type=Doc).hex(),
+            "js": msgspec.json.encode(c, type=Doc).decode(),
+            "obj": {"end": c.end if isinstance(c.end, str) else list(c.end)},
+        }
+        for c in cases
+    ]
+
+    driver = f"""
+    import {{ msgpack, json }} from "./codec.mjs";
+    const ref = {json.dumps(ref)};
+    const hex = (u) => Buffer.from(u).toString("hex");
+    let ok = true;
+    for (const c of ref) {{
+      const mp = hex(msgpack.encode(c.obj)) === c.mp;
+      const js = json.encode(c.obj) === c.js;
+      const mb = msgpack.decode(Uint8Array.from(Buffer.from(c.mp, "hex")));
+      const jb = json.decode(c.js);
+      const dec = JSON.stringify(mb) === JSON.stringify(c.obj)
+               && JSON.stringify(jb) === JSON.stringify(c.obj);
+      ok = ok && mp && js && dec;
+    }}
+    console.log(JSON.stringify({{ ok }}));
+    """
+    out = json.loads(_run_node(msgspec.javascript.codec(Doc), driver, tmp_path))
+    assert out["ok"] is True
+
+
+@needs_node
 def test_node_bigint_byte_compat(tmp_path):
     class Big(Struct):
         a: Int

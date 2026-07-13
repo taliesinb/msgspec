@@ -308,6 +308,25 @@ class _CodecGenerator:
             branches.append((f'typeof {v} === "string"', f"w.str({v});"))
         if has_bytes:
             branches.append((f"{v} instanceof Uint8Array", f"w.bin({v});"))
+        # Container members, dispatched by JS runtime shape (checked after the
+        # more specific `Uint8Array`/`Set` cases; a plain object is a dict).
+        arrays = [
+            m for m in others
+            if isinstance(m, (mi.ListType, mi.VarTupleType, mi.TupleType))
+        ]
+        sets = [m for m in others if isinstance(m, (mi.SetType, mi.FrozenSetType))]
+        maps = [m for m in others if isinstance(m, (mi.DictType, mi.FrozenDictType))]
+        if len(arrays) > 1 or len(sets) > 1 or len(maps) > 1:
+            raise NotImplementedError(
+                "msgspec.javascript codec can't disambiguate a union with multiple "
+                f"same-shape members: {others!r}"
+            )
+        if sets:
+            branches.append((f"{v} instanceof Set", self.enc(sets[0], v)))
+        if arrays:
+            branches.append((f"Array.isArray({v})", self.enc(arrays[0], v)))
+        if maps:
+            branches.append((f'typeof {v} === "object"', self.enc(maps[0], v)))
         if not branches:
             raise NotImplementedError(
                 f"msgspec.javascript codec can't encode union with members {others!r}"
@@ -389,6 +408,29 @@ class _CodecGenerator:
             for m in others
         ):
             lines.append("if (_t === 0xc4 || _t === 0xc5 || _t === 0xc6) return r.bin();")
+        # Container members, dispatched on the MessagePack tag.
+        arrays = [
+            m for m in others
+            if isinstance(m, (mi.ListType, mi.VarTupleType, mi.TupleType))
+        ]
+        sets = [m for m in others if isinstance(m, (mi.SetType, mi.FrozenSetType))]
+        maps = [m for m in others if isinstance(m, (mi.DictType, mi.FrozenDictType))]
+        if len(arrays) + len(sets) > 1 or len(maps) > 1:
+            raise NotImplementedError(
+                "msgspec.javascript codec can't disambiguate a union with multiple "
+                f"same-shape members: {others!r}"
+            )
+        array_member = (arrays + sets)[0] if (arrays or sets) else None
+        if array_member is not None:
+            lines.append(
+                "if ((_t >= 0x90 && _t <= 0x9f) || _t === 0xdc || _t === 0xdd) "
+                f"return {self.dec(array_member)};"
+            )
+        if maps:
+            lines.append(
+                "if ((_t >= 0x80 && _t <= 0x8f) || _t === 0xde || _t === 0xdf) "
+                f"return {self.dec(maps[0])};"
+            )
         if any(_is_bigint(m) for m in others):
             lines.append("return r.int64();")
         elif any(isinstance(m, mi.IntType) for m in others):
