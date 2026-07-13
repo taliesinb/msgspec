@@ -126,17 +126,33 @@ codec works with plain objects), and the output type-checks under ``tsc
     ``encode``/``decode`` from `@msgpack/msgpack`_ instead. That library can't
     serialize ``bigint`` natively, so the codec narrows to a ``number`` and
     *throws* above the JS safe-integer range unless ``force_int64=True`` enables
-    its ``useBigInt64`` mode. Tensor support (below) currently lives on this
-    path. Prefer the default embedded codec, which has neither limitation.
+    its ``useBigInt64`` mode. Prefer the default embedded codec, which has
+    neither limitation.
 
 
 Tensors
 ~~~~~~~
 
-Tensor support currently lives on the ``@msgpack/msgpack`` path, so tensor
-codecs are generated with ``embed_msgpack=False``. To encode/decode
-:doc:`tensors <tensors>`, pass the names of two TypeScript functions (assumed to
-be in scope) via ``tensor_encoder`` and ``tensor_decoder``:
+The default embedded codec supports :doc:`tensors <tensors>` natively. A
+``Tensor[...]`` field decodes to a ``TensorHandle`` - a class (re-exported by
+the generated module) holding the packed ``array`` (a typed array chosen by
+dtype), the ``dtype`` string, and the ``shape``, mirroring ``msgspec.data``'s
+TensorHandle. Construct one to encode. Both the MessagePack ext form and the
+JSON object form are byte-identical to ``msgspec``:
+
+.. code-block:: typescript
+
+    import { msgpack, TensorHandle } from "./codec.ts";
+
+    const doc = msgpack.decode(bytes);
+    doc.weights.array;   // Float32Array
+    doc.weights.shape;   // [3]
+    msgpack.encode({ weights: new TensorHandle(new Float32Array([1, 2, 3]), "float32", [3]) });
+
+To host tensors as a third-party array type instead, use the
+``@msgpack/msgpack`` path (``embed_msgpack=False``) and pass the names of two
+TypeScript functions (assumed to be in scope) via ``tensor_encoder`` and
+``tensor_decoder``:
 
 - ``tensor_encoder(value) -> TensorHandle`` - called at tensor encode
   positions.

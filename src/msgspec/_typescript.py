@@ -316,9 +316,13 @@ class _SchemaGenerator:
                 key = "string"
             return f"Record<{key}, {self.to_ref(t.value_type)}>"
         elif isinstance(t, mi.TensorType):
-            # A packed tensor -> a typed array, dispatched on dtype. TypeScript
-            # can't express rank/shape, so ndims/sizes are dropped. dtype `None`
-            # (any) falls back to the generic typed-array view.
+            # In the embedded codec a tensor decodes to a `TensorHandle` (a typed
+            # array + dtype + shape), so the field type is `TensorHandle`. In the
+            # bare schema / external codec it's just a typed array, dispatched on
+            # dtype (TypeScript can't express rank/shape). dtype `None` (any)
+            # falls back to the generic typed-array view.
+            if self.embed:
+                return "TensorHandle"
             if t.dtype is None:
                 return "ArrayBufferView"
             return _DTYPE_TS_TENSOR[t.dtype]
@@ -886,9 +890,12 @@ def codec(
     a **type-directed** ``msgspec`` encoder. 64-bit / generic integer types
     round-trip as native ``bigint`` (hex strings in JSON when large); ``bytes``
     are base64 in JSON; ``Float32`` narrows to a 5-byte msgpack float32.
+    ``msgspec.data.Tensor`` fields decode to a re-exported ``TensorHandle``
+    (typed array + ``dtype`` + ``shape``).
 
     With ``embed_msgpack=False`` the older `@msgpack/msgpack`-based output is
-    produced instead (tensor support lives here; see the tensor params).
+    produced instead; in that mode tensors require the ``tensor_encoder`` /
+    ``tensor_decoder`` params (see below).
 
     Parameters
     ----------
@@ -923,16 +930,13 @@ def _codec_embed(type: Any, msgpack: bool, json: bool) -> str:
     component_types = _collect_component_types(type_infos)
     name_map = _build_name_map(component_types)
 
-    if _contains_tensor(root):
-        raise NotImplementedError(
-            "the embedded TypeScript codec doesn't support tensor types yet - "
-            "pass embed_msgpack=False to use the @msgpack/msgpack path"
-        )
-
     schema_gen = _SchemaGenerator(name_map, embed=True)
     jsgen = _js._CodecGenerator(name_map)
 
     parts = [_MSGPACK_RUNTIME_TS.strip()]
+    if _contains_tensor(root):
+        # Re-export the runtime's TensorHandle (as both a type and a value).
+        parts.append("export { TensorHandle };")
 
     # Type definitions. The codec works with plain objects, so struct shapes are
     # emitted as `interface` (not `class`) - accurate and `strict`-clean. Enums

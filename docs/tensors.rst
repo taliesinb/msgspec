@@ -145,4 +145,34 @@ type is a tensor (``Tensor[...]`` or ``TensorHandle``), including the
     extension code is self-identifying, always decode to a ``TensorHandle``.
 
 
+JavaScript / TypeScript
+-----------------------
+
+The :doc:`JavaScript <javascript>` and :doc:`TypeScript <typescript>` codecs
+support tensors natively (in the default embedded runtime - no third-party
+dependency). A ``Tensor[...]`` field decodes to a ``TensorHandle``: a small
+class, re-exported by the generated module, holding the packed ``array`` (a
+`typed array`_ picked by dtype - ``Float32Array``, ``BigInt64Array``, ...), the
+``dtype`` string, and the ``shape``. It mirrors ``msgspec.data``'s TensorHandle,
+so a decoded tensor looks nearly identical across Python and JS:
+
+.. code-block:: javascript
+
+    import { msgpack, TensorHandle } from "./codec.js";
+
+    const doc = msgpack.decode(bytes);
+    doc.field.array;   // Float32Array([...])
+    doc.field.dtype;   // "float32"
+    doc.field.shape;   // [2, 3]
+
+    // construct one to encode
+    const t = new TensorHandle(new Float32Array([1, 2, 3, 4, 5, 6]), "float32", [2, 3]);
+
+Both the MessagePack ext form and the JSON object form are byte-identical to
+``msgspec``'s. To decode into a third-party ndarray type instead, pass
+``tensor_encoder`` / ``tensor_decoder`` (the names of JS adapter functions
+converting your type to/from a ``TensorHandle``).
+
+
 .. _numpy: https://numpy.org/
+.. _typed array: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Typed_arrays

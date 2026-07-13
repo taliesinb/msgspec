@@ -719,3 +719,69 @@ class TestCodecEmbed:
         assert res.returncode == 0, res.stderr
         out = _json.loads(res.stdout.strip())
         assert out == {"mp": True, "json": True, "dec": True}
+
+    def _tensor_doc(self):
+        from msgspec.data import Float32, Tensor, UInt8
+
+        class Doc(Struct):
+            name: str
+            arr: Tensor[(2, 3), UInt8]
+            weights: Tensor[1, Float32]
+
+        return Doc
+
+    def test_tensor_structure(self):
+        # the embedded codec now handles tensors (no longer raises); a tensor
+        # field decodes to a TensorHandle, which is re-exported.
+        out = msgspec.typescript.codec(self._tensor_doc())
+        assert "export { TensorHandle };" in out
+        assert "  arr: TensorHandle;" in out
+        assert "w.tensor(" in out and "r.tensor()" in out
+
+    @needs_tsc
+    def test_tsc_tensor_clean(self, tmp_path):
+        (tmp_path / "codec.ts").write_text(
+            msgspec.typescript.codec(self._tensor_doc())
+        )
+        res = subprocess.run(
+            [TSC, "--strict", "--noEmit", "--target", "es2020",
+             "--lib", "es2020,dom", str(tmp_path / "codec.ts")],
+            capture_output=True, text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+
+    @needs_node
+    def test_node_tensor_roundtrip(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        Doc = self._tensor_doc()
+        value = Doc(
+            name="x",
+            arr=np.arange(6, dtype=np.uint8).reshape(2, 3),
+            weights=np.array([1.5, 2.5, -0.5], dtype=np.float32),
+        )
+        mp_hex = msgspec.msgpack.encode(value, type=Doc).hex()
+        js = msgspec.json.encode(value, type=Doc).decode()
+
+        (tmp_path / "codec.ts").write_text(msgspec.typescript.codec(Doc))
+        driver = f"""
+        import {{ msgpack, json, TensorHandle }} from "./codec.ts";
+        const mb: any = msgpack.decode(Uint8Array.from(Buffer.from({_json.dumps(mp_hex)}, "hex")));
+        const jb: any = json.decode({_json.dumps(js)});
+        console.log(JSON.stringify({{
+          mp: Buffer.from(msgpack.encode(mb)).toString("hex") === {_json.dumps(mp_hex)},
+          json: json.encode(jb) === {_json.dumps(js)},
+          handle: mb.arr instanceof TensorHandle,
+          meta: mb.arr.dtype === "uint8" && JSON.stringify(mb.arr.shape) === "[2,3]",
+          data: [...mb.arr.array].join(",") === "0,1,2,3,4,5",
+          f32: mb.weights.array instanceof Float32Array,
+        }}));
+        """
+        (tmp_path / "driver.ts").write_text(driver)
+        res = subprocess.run(
+            [NODE, "--experimental-strip-types", str(tmp_path / "driver.ts")],
+            capture_output=True, text=True,
+        )
+        assert res.returncode == 0, res.stderr
+        out = _json.loads(res.stdout.strip())
+        assert out == {"mp": True, "json": True, "handle": True,
+                       "meta": True, "data": True, "f32": True}

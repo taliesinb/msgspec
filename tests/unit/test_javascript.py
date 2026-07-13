@@ -396,3 +396,86 @@ def test_node_array_like_struct(tmp_path):
     out = json.loads(_run_node(msgspec.javascript.codec(Rec), driver, tmp_path))
     assert out["hex"] == expected_hex
     assert out["roundtrips"] is True
+
+
+def test_tensor_codec_structure():
+    from msgspec.data import Float32, Tensor, UInt8
+
+    class Doc(Struct):
+        arr: Tensor[(2, 3), UInt8]
+        w: Tensor[1, Float32]
+
+    src = msgspec.javascript.codec(Doc)
+    # the runtime path (w.tensor / r.tensor) and the JSON path are wired up, and
+    # TensorHandle is re-exported so callers can construct tensor values.
+    assert "w.tensor(" in src and "r.tensor()" in src
+    assert "encTensorJSON(" in src and "decTensorJSON(" in src
+    assert "export { TensorHandle };" in src
+
+
+def test_tensor_custom_encoder_decoder():
+    from msgspec.data import Float32, Tensor
+
+    class Doc(Struct):
+        w: Tensor[1, Float32]
+
+    # custom adapters hook a third-party tensor lib: they convert user <->
+    # TensorHandle while the runtime still handles the actual bytes.
+    src = msgspec.javascript.codec(Doc, tensor_encoder="toH", tensor_decoder="fromH")
+    assert "w.tensor(toH(" in src
+    assert "fromH(r.tensor())" in src
+    assert "encTensorJSON(toH(" in src
+    assert "fromH(decTensorJSON(" in src
+
+
+@needs_node
+def test_node_tensor_roundtrip(tmp_path):
+    np = pytest.importorskip("numpy")
+    from msgspec.data import Bool, Float32, Int64, Tensor, UInt8
+
+    class Doc(Struct):
+        name: str
+        arr: Tensor[(2, 3), UInt8]
+        weights: Tensor[1, Float32]
+        big: Tensor[None, Int64]
+        mask: Tensor[(2, 2), Bool]
+        bare: Tensor
+
+    value = Doc(
+        name="x",
+        arr=np.arange(6, dtype=np.uint8).reshape(2, 3),
+        weights=np.array([1.5, 2.5, -0.5], dtype=np.float32),
+        big=np.array([1, -2, 2**62], dtype=np.int64),
+        mask=np.array([[True, False], [False, True]], dtype=np.bool_),
+        bare=np.array([3.5, 4.5], dtype=np.float64),
+    )
+    ref_mp = msgspec.msgpack.encode(value, type=Doc).hex()
+    ref_json = msgspec.json.encode(value, type=Doc).decode()
+
+    driver = f"""
+    import {{ msgpack, json, TensorHandle }} from "./codec.mjs";
+    const refMp = Uint8Array.from(Buffer.from({json.dumps(ref_mp)}, "hex"));
+    const refJson = {json.dumps(ref_json)};
+    const dMp = msgpack.decode(refMp);
+    const dJson = json.decode(refJson);
+    console.log(JSON.stringify({{
+      mpHex: Buffer.from(msgpack.encode(dMp)).toString("hex"),
+      jsonOut: json.encode(dJson),
+      isHandle: dMp.arr instanceof TensorHandle,
+      dtype: dMp.arr.dtype,
+      shape: dMp.arr.shape,
+      data: [...dMp.arr.array],
+      f32: dMp.weights.array instanceof Float32Array,
+      bigOk: dMp.big.array[2] === (2n ** 62n),
+      big64: dMp.big.array instanceof BigInt64Array,
+      bareDtype: dJson.bare.dtype,
+    }}));
+    """
+    out = json.loads(_run_node(msgspec.javascript.codec(Doc), driver, tmp_path))
+    assert out["mpHex"] == ref_mp  # msgpack byte-identical
+    assert out["jsonOut"] == ref_json  # json byte-identical
+    assert out["isHandle"] is True
+    assert out["dtype"] == "uint8" and out["shape"] == [2, 3]
+    assert out["data"] == [0, 1, 2, 3, 4, 5]
+    assert out["f32"] is True and out["big64"] is True and out["bigOk"] is True
+    assert out["bareDtype"] == "float64"

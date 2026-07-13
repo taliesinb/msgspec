@@ -286,6 +286,28 @@ class Writer {
     this.raw(u);
   }
 
+  // A msgspec.data tensor (a `TensorHandle`) as ext type 84 ('T'), body:
+  // [version=1][dtype:u8][ndims:u8][shape...:i64-LE][packed little-endian data].
+  tensor(h: TensorHandle) {
+    const spec = _TDTYPE[h.dtype];
+    if (spec === undefined) throw new Error("msgpack: unknown tensor dtype " + h.dtype);
+    const shape = h.shape;
+    const nd = shape.length;
+    const a = h.array;
+    const raw = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+    const body = new Uint8Array(3 + nd * 8 + raw.length);
+    const dv = new DataView(body.buffer);
+    body[0] = 1;
+    body[1] = spec[0];
+    body[2] = nd;
+    let off = 3;
+    // Shape dims are big-endian int64 (msgpack byte order); the packed data
+    // that follows is native little-endian.
+    for (let i = 0; i < nd; i++) { dv.setBigInt64(off, BigInt(shape[i]), false); off += 8; }
+    body.set(raw, off);
+    this.ext(84, body);
+  }
+
   // Encode an arbitrary JS value (for `Any`-typed positions). Integers use the
   // smallest int form, bigints go through the 64-bit path, plain objects become
   // string-keyed maps.
@@ -432,7 +454,7 @@ class Reader {
   }
 
   // Returns [code, Uint8Array].
-  ext() {
+  ext(): [number, Uint8Array] {
     const t = this.b[this.p++];
     let len;
     if (t === 0xd4) len = 1;
@@ -449,6 +471,24 @@ class Reader {
     const data = this.b.slice(this.p, this.p + len);
     this.p += len;
     return [code, data];
+  }
+
+  // A msgspec.data tensor (ext type 84) -> a `TensorHandle`. The packed data is
+  // copied into a fresh, element-aligned buffer so the typed-array view is valid
+  // regardless of the tensor's offset within the message.
+  tensor() {
+    const data = this.ext()[1];
+    const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const spec = _TCODE[data[1]];
+    if (spec === undefined) throw new Error("msgpack: unknown tensor dtype code " + data[1]);
+    const nd = data[2];
+    const shape = new Array(nd);
+    let off = 3;
+    for (let i = 0; i < nd; i++) { shape[i] = Number(dv.getBigInt64(off, false)); off += 8; }
+    const sub = data.slice(off);
+    const Ctor = spec[1];
+    const array = new Ctor(sub.buffer, sub.byteOffset, sub.byteLength / Ctor.BYTES_PER_ELEMENT);
+    return new TensorHandle(array, spec[0], shape);
   }
 
   // Skip exactly one value (used for unknown struct fields).
@@ -556,6 +596,62 @@ function decMap(r: Reader, kfn: (r: Reader) => any, vfn: (r: Reader) => any) {
 // `JSON.stringify`. These helpers handle the values JSON can't carry natively:
 // `bytes` (base64), and 64-bit/generic integers (a hex string when they'd
 // exceed the JS safe-integer range), byte-compatible with `msgspec.json`.
+
+// --- Tensors (msgspec.data.Tensor) -----------------------------------------
+// A packed n-dimensional array. dtype name -> [wire code, TypedArray ctor].
+// `int64`/`uint64` use BigInt typed arrays; `bool` packs into a Uint8Array.
+const _TDTYPE: any = {
+  uint8: [0, Uint8Array],
+  uint16: [1, Uint16Array],
+  uint32: [2, Uint32Array],
+  uint64: [3, BigUint64Array],
+  int8: [4, Int8Array],
+  int16: [5, Int16Array],
+  int32: [6, Int32Array],
+  int64: [7, BigInt64Array],
+  float32: [8, Float32Array],
+  float64: [9, Float64Array],
+  bool: [10, Uint8Array],
+};
+const _TCODE: any[] = [];
+for (const _k in _TDTYPE) _TCODE[_TDTYPE[_k][0]] = [_k, _TDTYPE[_k][1]];
+
+// A decoded tensor: a TypedArray plus its dtype string and shape, mirroring
+// `msgspec.data`'s TensorHandle. Construct one to hand a tensor to `encode`.
+class TensorHandle {
+  type: string;
+  array: any;
+  dtype: string;
+  shape: number[];
+  constructor(array: any, dtype: string, shape: number[]) {
+    this.type = "TensorHandle";
+    this.array = array;
+    this.dtype = dtype;
+    this.shape = shape;
+  }
+}
+
+// The raw little-endian bytes backing a TensorHandle's TypedArray.
+function _tbytes(h: TensorHandle) {
+  const a = h.array;
+  return new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+}
+
+// A TensorHandle -> its JSON object form (data base64-encoded), byte-compatible
+// with `msgspec.json`'s tensor encoding.
+function encTensorJSON(h: TensorHandle) {
+  return { type: "tensor", shape: h.shape, dtype: h.dtype, data: b64encode(_tbytes(h)) };
+}
+
+// The inverse: a parsed JSON tensor object -> TensorHandle.
+function decTensorJSON(o: any) {
+  const spec = _TDTYPE[o.dtype];
+  if (spec === undefined) throw new Error("msgpack: unknown tensor dtype " + o.dtype);
+  const raw = b64decode(o.data);
+  const Ctor = spec[1];
+  const array = new Ctor(raw.buffer, raw.byteOffset, raw.byteLength / Ctor.BYTES_PER_ELEMENT);
+  return new TensorHandle(array, o.dtype, o.shape);
+}
 
 const _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 let _B64R: Record<string, number> | null = null;

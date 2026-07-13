@@ -22,6 +22,7 @@ from . import inspect as mi
 from ._msgpack_runtime_js import RUNTIME as _MSGPACK_RUNTIME
 from ._typescript import (
     _build_name_map,
+    _contains_tensor,
     _literal_value,
     _prop_name,
     _str,
@@ -167,9 +168,26 @@ def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type
 
 
 class _CodecGenerator:
-    def __init__(self, name_map: dict[Any, str]):
+    def __init__(
+        self,
+        name_map: dict[Any, str],
+        tensor_encoder: str | None = None,
+        tensor_decoder: str | None = None,
+    ):
         self.name_map = name_map
+        self.tensor_encoder = tensor_encoder
+        self.tensor_decoder = tensor_decoder
         self._counter = 0
+
+    def _tensor_in(self, v: str) -> str:
+        """The value to pack: the user value adapted to a `TensorHandle` if a
+        custom `tensor_encoder` was supplied, else the value itself."""
+        return f"{self.tensor_encoder}({v})" if self.tensor_encoder else v
+
+    def _tensor_out(self, base: str) -> str:
+        """A decoded `TensorHandle`, adapted back to the user's tensor type if a
+        custom `tensor_decoder` was supplied."""
+        return f"{self.tensor_decoder}({base})" if self.tensor_decoder else base
 
     def _fresh(self) -> str:
         self._counter += 1
@@ -191,6 +209,8 @@ class _CodecGenerator:
             return f"w.str({v});"
         if isinstance(t, (mi.BytesType, mi.ByteArrayType, mi.MemoryViewType)):
             return f"w.bin({v});"
+        if isinstance(t, mi.TensorType):
+            return f"w.tensor({self._tensor_in(v)});"
         if isinstance(t, (mi.AnyType, mi.RawType)):
             return f"w.value({v});"
         if isinstance(t, mi.EnumType):
@@ -355,6 +375,8 @@ class _CodecGenerator:
             return "r.str()"
         if isinstance(t, (mi.BytesType, mi.ByteArrayType, mi.MemoryViewType)):
             return "r.bin()"
+        if isinstance(t, mi.TensorType):
+            return self._tensor_out("r.tensor()")
         if isinstance(t, (mi.AnyType, mi.RawType)):
             return "r.value()"
         if isinstance(t, mi.EnumType):
@@ -592,6 +614,8 @@ class _CodecGenerator:
             return f"encHexInt({v}, {_js_bool(signed)}, false)"
         if isinstance(t, (mi.BytesType, mi.ByteArrayType, mi.MemoryViewType)):
             return f"b64encode({v})"
+        if isinstance(t, mi.TensorType):
+            return f"encTensorJSON({self._tensor_in(v)})"
         if isinstance(t, (mi.ListType, mi.VarTupleType)):
             return f"{v}.map((_e) => {self.json_enc(t.item_type, '_e')})"
         if isinstance(t, (mi.SetType, mi.FrozenSetType)):
@@ -624,6 +648,8 @@ class _CodecGenerator:
             return f"decHexInt({o})"
         if isinstance(t, (mi.BytesType, mi.ByteArrayType, mi.MemoryViewType)):
             return f"b64decode({o})"
+        if isinstance(t, mi.TensorType):
+            return self._tensor_out(f"decTensorJSON({o})")
         if isinstance(t, (mi.ListType, mi.VarTupleType)):
             return f"{o}.map((_e) => {self.json_dec(t.item_type, '_e')})"
         if isinstance(t, (mi.SetType, mi.FrozenSetType)):
@@ -758,7 +784,14 @@ class _CodecGenerator:
         return f"export function decodeJson{name}(o) {{\n{_ind(body)}\n}}"
 
 
-def codec(type: Any, *, msgpack: bool = True, json: bool = True) -> str:
+def codec(
+    type: Any,
+    *,
+    msgpack: bool = True,
+    json: bool = True,
+    tensor_encoder: str | None = None,
+    tensor_decoder: str | None = None,
+) -> str:
     """Generate a self-contained JavaScript codec for ``type``.
 
     The output is a dependency-free ES module. Depending on the flags it exports
@@ -775,6 +808,10 @@ def codec(type: Any, *, msgpack: bool = True, json: bool = True) -> str:
     the JS safe-integer range; ``bytes`` are base64 in JSON; ``Float32`` narrows
     to a 5-byte msgpack float32.
 
+    ``msgspec.data.Tensor`` fields decode to a ``TensorHandle`` (a re-exported
+    class holding a ``TypedArray`` plus its ``dtype`` and ``shape``, mirroring
+    ``msgspec.data``'s TensorHandle); construct one to encode a tensor value.
+
     Parameters
     ----------
     type : type
@@ -783,6 +820,12 @@ def codec(type: Any, *, msgpack: bool = True, json: bool = True) -> str:
         Emit the ``msgpack`` namespace (default ``True``).
     json : bool, optional
         Emit the ``json`` namespace (default ``True``).
+    tensor_encoder, tensor_decoder : str, optional
+        Names of JS functions to adapt a custom tensor type to/from a
+        ``TensorHandle`` (e.g. to hook a third-party ndarray library):
+        ``tensor_encoder(value)`` must return a ``TensorHandle`` on encode, and
+        ``tensor_decoder(handle)`` receives a decoded ``TensorHandle`` on decode.
+        When omitted, ``TensorHandle`` is used directly.
 
     Returns
     -------
@@ -795,9 +838,12 @@ def codec(type: Any, *, msgpack: bool = True, json: bool = True) -> str:
     (root,) = mi.multi_type_info([type])
     component_types = _collect_component_types([root])
     name_map = _build_name_map(component_types)
-    gen = _CodecGenerator(name_map)
+    gen = _CodecGenerator(name_map, tensor_encoder, tensor_decoder)
 
     parts = [_MSGPACK_RUNTIME.strip()]
+    if _contains_tensor(root):
+        # Re-export the runtime's TensorHandle so callers can construct tensors.
+        parts.append("export { TensorHandle };")
 
     if msgpack:
         for cls, t in component_types.items():

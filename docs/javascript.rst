@@ -160,9 +160,11 @@ directory; in an installed wheel, to the copy bundled inside the package.
 .. note::
 
     The codec is a *structural* transform - no runtime validation is performed.
-    ``datetime``/``UUID``/``Decimal`` and tensor types are not yet supported and
-    raise ``NotImplementedError``; ``omit_defaults`` structs are encoded with all
-    fields present. The inlined runtime is authored and tested at
+    ``datetime``/``UUID``/``Decimal`` types are not yet supported and raise
+    ``NotImplementedError``; ``omit_defaults`` structs are encoded with all
+    fields present. :doc:`Tensors <tensors>` **are** supported - they decode to a
+    re-exported ``TensorHandle`` (typed array + ``dtype`` + ``shape``). The
+    inlined runtime is authored and tested at
     ``javascript/src/msgpack.mjs`` in the repository, and is also published as a
     standalone package for direct use.
 

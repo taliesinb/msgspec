@@ -39,9 +39,17 @@ _TS_PARAMS = {
     "bin(u) {": "bin(u: Uint8Array) {",
     "arrayHeader(n) {": "arrayHeader(n: number) {",
     "mapHeader(n) {": "mapHeader(n: number) {",
-    "ext(code, u) {": "ext(code: number, u: Uint8Array) {",
+    "ext(code, u) {": "ext(code: number, u: Uint8Array) {",  # Writer.ext
+    "ext() {": "ext(): [number, Uint8Array] {",  # Reader.ext (typed tuple return)
+    "tensor(h) {": "tensor(h: TensorHandle) {",  # Writer.tensor (Reader.tensor has no arg)
     "value(x) {": "value(x: any) {",  # Writer.value (Reader.value has no arg)
     "constructor(bytes) {": "constructor(bytes: Uint8Array) {",
+    "constructor(array, dtype, shape) {": (
+        "constructor(array: any, dtype: string, shape: number[]) {"
+    ),
+    "function _tbytes(h) {": "function _tbytes(h: TensorHandle) {",
+    "function encTensorJSON(h) {": "function encTensorJSON(h: TensorHandle) {",
+    "function decTensorJSON(o) {": "function decTensorJSON(o: any) {",
     "function b64encode(u8) {": "function b64encode(u8: Uint8Array) {",
     "function b64decode(str) {": "function b64decode(str: string) {",
     "function encHexInt(v, signed, force) {": (
@@ -61,6 +69,10 @@ _TS_PARAMS = {
 _TS_FIELDS = {
     "class Writer {\n": "class Writer {\n  b: Uint8Array;\n  dv: DataView;\n  n: number;\n",
     "class Reader {\n": "class Reader {\n  b: Uint8Array;\n  dv: DataView;\n  p: number;\n",
+    "class TensorHandle {\n": (
+        "class TensorHandle {\n  type: string;\n  array: any;\n"
+        "  dtype: string;\n  shape: number[];\n"
+    ),
 }
 
 
@@ -68,6 +80,8 @@ _TS_FIELDS = {
 _TS_EXTRA = {
     "let _B64R = null;": "let _B64R: Record<string, number> | null = null;",
     "const o = {};": "const o: any = {};",
+    "const _TDTYPE = {": "const _TDTYPE: any = {",
+    "const _TCODE = [];": "const _TCODE: any[] = [];",
 }
 
 
