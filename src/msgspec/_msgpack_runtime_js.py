@@ -479,9 +479,15 @@ class Reader {
     const shape = new Array(nd);
     let off = 3;
     for (let i = 0; i < nd; i++) { shape[i] = Number(dv.getBigInt64(off, false)); off += 8; }
-    const sub = data.slice(off);
+    // Copy the packed bytes into a fresh, zero-offset ArrayBuffer so the
+    // typed-array view is element-aligned regardless of the source buffer's
+    // offset. (A Node Buffer's `.slice()` returns an unaligned *view*, and a
+    // typed array requires its byteOffset be a multiple of the element size.)
     const Ctor = spec[1];
-    const array = new Ctor(sub.buffer, sub.byteOffset, sub.byteLength / Ctor.BYTES_PER_ELEMENT);
+    const nbytes = data.byteLength - off;
+    const buf = new ArrayBuffer(nbytes);
+    new Uint8Array(buf).set(new Uint8Array(data.buffer, data.byteOffset + off, nbytes));
+    const array = new Ctor(buf, 0, nbytes / Ctor.BYTES_PER_ELEMENT);
     return new TensorHandle(array, spec[0], shape);
   }
 

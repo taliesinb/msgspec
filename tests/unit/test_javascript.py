@@ -479,3 +479,43 @@ def test_node_tensor_roundtrip(tmp_path):
     assert out["data"] == [0, 1, 2, 3, 4, 5]
     assert out["f32"] is True and out["big64"] is True and out["bigOk"] is True
     assert out["bareDtype"] == "float64"
+
+
+@needs_node
+def test_node_tensor_decode_from_node_buffer(tmp_path):
+    """Regression: decoding a tensor from a raw Node `Buffer` must not throw.
+
+    `Buffer.prototype.slice()` returns an unaligned *view* (not a copy), so the
+    packed bytes must be copied to a fresh zero-offset buffer before the
+    typed-array view - otherwise `new Float64Array(buf, offset, ...)` raises a
+    RangeError when `offset` isn't a multiple of 8.
+    """
+    np = pytest.importorskip("numpy")
+    from msgspec.data import Float64, Tensor
+
+    class Doc(Struct):
+        name: str  # shifts the tensor to a non-8-aligned offset
+        m: Tensor[(2, 2), Float64]
+
+    value = Doc(name="abc", m=np.array([[1.5, 2.5], [3.5, 4.5]], dtype=np.float64))
+    mp_hex = msgspec.msgpack.encode(value, type=Doc).hex()
+
+    driver = f"""
+    import {{ msgpack, TensorHandle }} from "./codec.mjs";
+    // a real Node Buffer (its .slice() returns a view, unlike Uint8Array)
+    const buf = Buffer.from({json.dumps(mp_hex)}, "hex");
+    const d = msgpack.decode(buf);
+    console.log(JSON.stringify({{
+      isBuffer: Buffer.isBuffer(buf),
+      handle: d.m instanceof TensorHandle,
+      f64: d.m.array instanceof Float64Array,
+      data: [...d.m.array].join(","),
+    }}));
+    """
+    out = json.loads(_run_node(msgspec.javascript.codec(Doc), driver, tmp_path))
+    assert out == {
+        "isBuffer": True,
+        "handle": True,
+        "f64": True,
+        "data": "1.5,2.5,3.5,4.5",
+    }
