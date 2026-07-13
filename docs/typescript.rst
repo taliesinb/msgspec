@@ -90,70 +90,53 @@ is handled by the codec (see below), not the schema.
 Encoders and decoders
 ---------------------
 
-`msgspec.typescript.codec` emits everything ``schema`` does, plus a matching
-pair of MessagePack functions per struct and a top-level ``encode(value)`` /
-``decode(bytes)``. The generated code imports ``encode``/``decode`` from
-`@msgpack/msgpack`_.
-
-The transformation is *structural* - no runtime validation is performed.
-Tagged-union structs emit their discriminant tag when **encoding**, and the
-union is dispatched on that tag when **decoding**:
-
-.. code-block:: python
-
-    from typing import Union
-    from msgspec import Struct
-
-
-    class Cat(Struct, tag="cat"):
-        name: str
-
-
-    class Dog(Struct, tag="dog"):
-        name: str
-
-
-    print(msgspec.typescript.codec(Union[Cat, Dog]))
-
-
-produces (abbreviated) encoders that add the tag:
+`msgspec.typescript.codec` emits everything ``schema`` does, plus per-struct
+encode/decode functions and namespaced ``msgpack`` and ``json`` codecs. By
+default (``embed_msgpack=True``) it is **self-contained**: it inlines its own
+tight MessagePack reader/writer, so there is no ``@msgpack/msgpack`` dependency.
 
 .. code-block:: typescript
 
-    export function encodeCat(value: Cat): unknown {
-      return {
-        type: "cat",
-        name: value["name"],
-      };
-    }
+    import { msgpack, json } from "./codec.ts";
 
-and a top-level codec that dispatches on it when decoding (a non-nameable
-top-level type like a union gets a generated ``Root`` alias):
+    const bytes: Uint8Array = msgpack.encode(value);
+    const value2 = msgpack.decode(bytes);
 
-.. code-block:: typescript
+    const text: string = json.encode(value);
+    const value3 = json.decode(text);
 
-    export type Root = Cat | Dog;
+The ``msgpack`` and ``json`` namespaces are the **client side of a type-directed
+``msgspec`` encoder** (see :doc:`type-directed-encoding`): pass the same
+``type`` to `msgspec.msgpack.encode` / `msgspec.json.encode` on the Python side
+and the two are byte/format-compatible. In particular ``Int64``/``UInt64``/etc.
+round-trip as native ``bigint`` (hex strings in JSON when large), ``bytes`` are
+``Uint8Array`` (base64 in JSON), and ``Float32`` is a 5-byte MessagePack float.
+The transformation is *structural* - no runtime validation is performed;
+tagged-union structs emit their discriminant tag when encoding and are
+dispatched on it when decoding.
 
-    export function decode(bytes: Uint8Array): Root {
-      return ((v: any) => {
-        switch (v["type"]) {
-          case "cat": return decodeCat(v);
-          case "dog": return decodeDog(v);
-        }
-        throw new Error("unexpected tag for type union");
-      })(_mpDecode(bytes)) as Root;
-    }
+Which namespaces to emit is controlled by the ``msgpack`` / ``json`` flags
+(both ``True`` by default). Struct shapes are emitted as ``interface`` (the
+codec works with plain objects), and the output type-checks under ``tsc
+--strict``.
 
-The generated ``encode`` produces byte-for-byte identical MessagePack to
-`msgspec.msgpack.encode`, so the two ends interoperate directly.
+.. note::
+
+    Passing ``embed_msgpack=False`` produces the older output that imports
+    ``encode``/``decode`` from `@msgpack/msgpack`_ instead. That library can't
+    serialize ``bigint`` natively, so the codec narrows to a ``number`` and
+    *throws* above the JS safe-integer range unless ``force_int64=True`` enables
+    its ``useBigInt64`` mode. Tensor support (below) currently lives on this
+    path. Prefer the default embedded codec, which has neither limitation.
 
 
 Tensors
 ~~~~~~~
 
-To encode/decode :doc:`tensors <tensors>`, pass the names of two TypeScript
-functions (assumed to be in scope) via ``tensor_encoder`` and
-``tensor_decoder``:
+Tensor support currently lives on the ``@msgpack/msgpack`` path, so tensor
+codecs are generated with ``embed_msgpack=False``. To encode/decode
+:doc:`tensors <tensors>`, pass the names of two TypeScript functions (assumed to
+be in scope) via ``tensor_encoder`` and ``tensor_decoder``:
 
 - ``tensor_encoder(value) -> TensorHandle`` - called at tensor encode
   positions.
@@ -176,7 +159,10 @@ byte-compatible with ``msgspec``.
 
 
     src = msgspec.typescript.codec(
-        Layer, tensor_encoder="wrapTensor", tensor_decoder="unwrapTensor"
+        Layer,
+        tensor_encoder="wrapTensor",
+        tensor_decoder="unwrapTensor",
+        embed_msgpack=False,
     )
 
 ``wrapTensor``/``unwrapTensor`` are whatever bridges your chosen JS array type

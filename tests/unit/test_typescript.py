@@ -1,5 +1,8 @@
 import datetime
 import enum
+import json as _json
+import shutil
+import subprocess
 import sys
 import uuid
 from typing import (
@@ -22,6 +25,11 @@ from msgspec import Struct
 py312_plus = pytest.mark.skipif(
     sys.version_info < (3, 12), reason="3.12+ only"
 )
+
+NODE = shutil.which("node")
+TSC = shutil.which("tsc")
+needs_node = pytest.mark.skipif(NODE is None, reason="node not installed")
+needs_tsc = pytest.mark.skipif(TSC is None, reason="tsc not installed")
 
 
 def ts(type):
@@ -202,7 +210,8 @@ def test_ext_type_raises():
 
 
 def cc(type):
-    return msgspec.typescript.codec(type)
+    # These tests cover the legacy `@msgpack/msgpack` path.
+    return msgspec.typescript.codec(type, embed_msgpack=False)
 
 
 class TestCodec:
@@ -361,7 +370,7 @@ class TestCodec:
         class Foo(Struct):
             b: Int
 
-        out = msgspec.typescript.codec(Foo)  # default force_int64=False
+        out = msgspec.typescript.codec(Foo, embed_msgpack=False)  # default force_int64=False
         assert "function _toSafeInt(" in out
         assert 'b: _toSafeInt(value["b"]),' in out
         assert "useBigInt64" not in out
@@ -372,7 +381,7 @@ class TestCodec:
         class Foo(Struct):
             b: Int
 
-        out = msgspec.typescript.codec(Foo, force_int64=True)
+        out = msgspec.typescript.codec(Foo, force_int64=True, embed_msgpack=False)
         assert "_toSafeInt" not in out
         assert "const _codecOptions = { useBigInt64: true };" in out
         assert 'b: value["b"],' in out  # bigint passed through directly
@@ -423,14 +432,14 @@ class TestCodecTensor:
     def test_requires_hooks(self):
         Layer = self._layer()
         with pytest.raises(TypeError, match="tensor_encoder"):
-            msgspec.typescript.codec(Layer)
+            msgspec.typescript.codec(Layer, embed_msgpack=False)
         with pytest.raises(TypeError, match="tensor_decoder"):
-            msgspec.typescript.codec(Layer, tensor_encoder="wrap")
+            msgspec.typescript.codec(Layer, tensor_encoder="wrap", embed_msgpack=False)
 
     def test_emits_runtime_and_hooks(self):
         Layer = self._layer()
         out = msgspec.typescript.codec(
-            Layer, tensor_encoder="wrapT", tensor_decoder="unwrapT"
+            Layer, tensor_encoder="wrapT", tensor_decoder="unwrapT", embed_msgpack=False
         )
         # import + runtime
         assert "ExtensionCodec" in out
@@ -447,7 +456,7 @@ class TestCodecTensor:
     def test_tensor_ext_code_84(self):
         Layer = self._layer()
         out = msgspec.typescript.codec(
-            Layer, tensor_encoder="wrapT", tensor_decoder="unwrapT"
+            Layer, tensor_encoder="wrapT", tensor_decoder="unwrapT", embed_msgpack=False
         )
         assert "const _TENSOR_EXT_TYPE = 84;" in out
 
@@ -544,8 +553,9 @@ def test_data_scalar_ts(dtype_alias, expected):
 def test_data_scalar_any_ts():
     from msgspec import data as md
 
+    # `Scalar` is the accurate union `Int | Float | Bool` (Int -> bigint).
     (root,), _ = msgspec.typescript.schema_components([md.Scalar])
-    assert root == "number | boolean"
+    assert root == "bigint | number | boolean"
 
 
 @pytest.mark.parametrize(
@@ -586,7 +596,7 @@ def test_data_types_in_struct_ts():
 
     out = ts(Layer)
     assert "  weights: Float32Array;" in out
-    assert "  bias: number | boolean;" in out
+    assert "  bias: bigint | number | boolean;" in out
     assert "  count: bigint;" in out
 
 
@@ -607,3 +617,105 @@ def test_pep695_generic_alias_specializations_distinct():
     assert "  strs: Vec_str;" in out
     assert "export type Vec_int = Array<number>;" in out
     assert "export type Vec_str = Array<string>;" in out
+
+
+class TestCodecEmbed:
+    """The default `embed_msgpack=True` path: our own inlined msgpack runtime,
+    namespaced `msgpack`/`json` exports, byte/format-compatible with a
+    type-directed `msgspec` encoder."""
+
+    def _doc(self):
+        from msgspec.data import Float32, Int64, Scalar
+
+        class Cat(Struct, tag="cat"):
+            name: str
+            lives: Int64
+
+        class Dog(Struct, tag="dog"):
+            legs: int
+
+        class Doc(Struct):
+            pet: Union[Cat, Dog]
+            ratio: Float32
+            blob: bytes
+            scores: Dict[str, Int64]
+            val: Scalar
+            maybe: Optional[str]
+
+        return Doc
+
+    def test_structure(self):
+        out = msgspec.typescript.codec(self._doc())
+        assert "import" not in out  # self-contained, no @msgpack/msgpack
+        assert "class Writer" in out and "class Reader" in out
+        assert "export const msgpack = {" in out
+        assert "export const json = {" in out
+        # struct shapes are interfaces; bytes is Uint8Array; Int64 is bigint
+        assert "export interface Doc {" in out
+        assert "  blob: Uint8Array;" in out
+        assert "  lives: bigint;" in out
+        assert "w.float32(v[\"ratio\"]);" in out
+
+    def test_flags(self):
+        class P(Struct):
+            x: int
+
+        assert "export const json = {" not in msgspec.typescript.codec(P, json=False)
+        assert "export const msgpack = {" not in msgspec.typescript.codec(
+            P, msgpack=False
+        )
+        with pytest.raises(ValueError):
+            msgspec.typescript.codec(P, msgpack=False, json=False)
+
+    @needs_tsc
+    def test_tsc_strict_clean(self, tmp_path):
+        src = msgspec.typescript.codec(self._doc())
+        (tmp_path / "codec.ts").write_text(src)
+        res = subprocess.run(
+            [TSC, "--strict", "--noEmit", "--target", "es2020",
+             "--lib", "es2020,dom", str(tmp_path / "codec.ts")],
+            capture_output=True, text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+
+    @needs_node
+    def test_node_roundtrip_matches_python(self, tmp_path):
+        from msgspec.data import Int64, Scalar
+
+        class Cat(Struct, tag="cat"):
+            name: str
+            lives: Int64
+
+        class Doc(Struct):
+            pet: Cat
+            blob: bytes
+            val: Scalar
+
+        value = Doc(pet=Cat(name="Reo", lives=2**62), blob=b"\x00\x01", val=2**61)
+        mp_hex = msgspec.msgpack.encode(value, type=Doc).hex()
+        js = msgspec.json.encode(value, type=Doc).decode()
+
+        (tmp_path / "codec.ts").write_text(msgspec.typescript.codec(Doc))
+        driver = f"""
+        import {{ msgpack, json }} from "./codec.ts";
+        const obj: any = {{ pet: {{ type: "cat", name: "Reo", lives: 2n ** 62n }},
+                            blob: new Uint8Array([0, 1]), val: 2n ** 61n }};
+        const mpHex = Buffer.from(msgpack.encode(obj)).toString("hex");
+        const jsText = json.encode(obj);
+        const mb: any = msgpack.decode(Uint8Array.from(Buffer.from({_json.dumps(mp_hex)}, "hex")));
+        const jb: any = json.decode({_json.dumps(js)});
+        console.log(JSON.stringify({{
+          mp: mpHex === {_json.dumps(mp_hex)},
+          json: jsText === {_json.dumps(js)},
+          dec: mb.pet.lives === 2n ** 62n && jb.val === 2n ** 61n
+               && [...jb.blob].join(",") === "0,1",
+        }}));
+        """
+        (tmp_path / "driver.ts").write_text(driver)
+        res = subprocess.run(
+            [NODE, "--experimental-strip-types", str(tmp_path / "driver.ts")],
+            capture_output=True, text=True,
+        )
+        assert res.returncode == 0, res.stderr
+        out = _json.loads(res.stdout.strip())
+        assert out == {"mp": True, "json": True, "dec": True}

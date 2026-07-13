@@ -37,23 +37,41 @@ from ._utils import (  # type: ignore
 )
 from .data import (
     DTYPE_ALIASES,
+    Bool as _Bool,
     DType,
     Float,
     Int,
-    Scalar,
+    Scalar as _Scalar,
     TensorMeta as _TensorMeta,
+    UInt,
     parse_dtype as _parse_dtype,
 )
 
-# Precomputed map from each `msgspec.data` scalar alias to its dtype string
-# (or None for the dtype-agnostic `Scalar`). Membership is used as a cheap
-# fast-path gate in `_Translator.translate`; the values give the `ScalarType`
-# dtype without re-parsing. `Int`/`Float` are the generic "keep it an integer /
-# float" markers, mapped to int64 / float64.
-_SCALAR_ALIASES: dict[Any, DType | None] = {a: _parse_dtype(a) for a in DTYPE_ALIASES}
-_SCALAR_ALIASES[Scalar] = None
-_SCALAR_ALIASES[Int] = _parse_dtype(Int)
-_SCALAR_ALIASES[Float] = _parse_dtype(Float)
+# The `msgspec.data` integer/float format labels carried on `IntType.itype` /
+# `FloatType.ftype`.
+_IntFormat = Literal[
+    "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64",
+    "int", "uint",
+]
+_FloatFormat = Literal["float32", "float64", "float"]
+
+# Precomputed maps from each `msgspec.data` int/float marker alias to its
+# format label. Used as a cheap fast-path gate in `_Translator.translate`; the
+# markers resolve to `IntType(itype=...)` / `FloatType(ftype=...)`. `Bool` and
+# `Scalar` are deliberately absent - they unwrap naturally to `BoolType` and to
+# the `Int | Float | Bool` union.
+_INT_FORMATS: dict[Any, str] = {}
+_FLOAT_FORMATS: dict[Any, str] = {}
+for _a in DTYPE_ALIASES:
+    _dt = _parse_dtype(_a)
+    if _dt in ("float32", "float64"):
+        _FLOAT_FORMATS[_a] = _dt
+    elif _dt != "bool":  # skip `Bool` -> handled as BoolType
+        _INT_FORMATS[_a] = _dt
+_INT_FORMATS[Int] = "int"
+_INT_FORMATS[UInt] = "uint"
+_FLOAT_FORMATS[Float] = "float"
 
 __all__ = (
     "type_info",
@@ -95,7 +113,6 @@ __all__ = (
     "DataclassType",
     "StructType",
     "AbstractStructType",
-    "ScalarType",
     "TensorType",
     "is_struct",
     "is_struct_type",
@@ -159,6 +176,12 @@ class IntType(Type):
         If set, an instance of this type must be less than or equal to ``le``.
     multiple_of: int, optional
         If set, an instance of this type must be a multiple of ``multiple_of``.
+    itype: str, optional
+        The `msgspec.data` integer format, if the type was one of the integer
+        markers (``'int8'``…``'uint64'``, or ``'int'``/``'uint'`` for the generic
+        ``Int``/``UInt``). ``None`` for a plain ``int``. This is what makes a
+        value round-trip as a ``bigint`` (and hex-string in JSON) on the
+        JavaScript side.
     """
 
     gt: int | None = None
@@ -166,6 +189,7 @@ class IntType(Type):
     lt: int | None = None
     le: int | None = None
     multiple_of: int | None = None
+    itype: _IntFormat | None = None
 
 
 class FloatType(Type):
@@ -183,6 +207,11 @@ class FloatType(Type):
         If set, an instance of this type must be less than or equal to ``le``.
     multiple_of: float, optional
         If set, an instance of this type must be a multiple of ``multiple_of``.
+    ftype: str, optional
+        The `msgspec.data` float format, if the type was one of the float
+        markers (``'float32'``, ``'float64'``, or ``'float'`` for the generic
+        ``Float``). ``None`` for a plain ``float``. ``'float32'`` narrows to a
+        5-byte MessagePack float32.
     """
 
     gt: float | None = None
@@ -190,6 +219,7 @@ class FloatType(Type):
     lt: float | None = None
     le: float | None = None
     multiple_of: float | None = None
+    ftype: _FloatFormat | None = None
 
 
 class StrType(Type):
@@ -677,10 +707,6 @@ class AbstractStructType(StructType, dict=True):
         return UnionType(tuple(type_info(c) for c in self.concrete_classes))
 
 
-class ScalarType(Type):
-    dtype: DType | None
-
-
 class TensorType(Type):
     ndims: int | None                     # None means 'any number of axes'
     sizes: tuple[int | None, ...] | None  # None means 'any size for this axis', or while sizes is None if size unknown
@@ -911,8 +937,19 @@ class _Translator:
                 sizes=getattr(typ, "sizes", None),
                 dtype=getattr(typ, "dtype", None),
             )
-        if tt is _TypeAliasType and typ in _SCALAR_ALIASES:
-            return ScalarType(_SCALAR_ALIASES[typ])
+        if tt is _TypeAliasType:
+            itype = _INT_FORMATS.get(typ)
+            if itype is not None:
+                return IntType(itype=itype)
+            ftype = _FLOAT_FORMATS.get(typ)
+            if ftype is not None:
+                return FloatType(ftype=ftype)
+            # `Bool`/`Scalar` are `msgspec.data` primitives too - resolve them
+            # transparently (never as a named alias, even with aliases=True).
+            if typ is _Bool:
+                return BoolType()
+            if typ is _Scalar:
+                return self.translate(_Scalar.__value__)
 
         if self.aliases:
             try:

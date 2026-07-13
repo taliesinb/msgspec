@@ -2,6 +2,7 @@ from typing import Any, Literal, TypeAlias, overload
 
 __all__ = [
     'Int',
+    'UInt',
     'Float',
     'UInt8',
     'UInt16',
@@ -26,6 +27,7 @@ __all__ = [
 # conveys portably.
 
 Int:  TypeAlias = int
+UInt: TypeAlias = int
 Float: TypeAlias = float
 
 UInt8: TypeAlias = int
@@ -40,7 +42,7 @@ Float32: TypeAlias = float
 Float64: TypeAlias = float
 Bool: TypeAlias = bool
 
-Scalar: TypeAlias = int | float | bool
+Scalar: TypeAlias = int | float | bool  # runtime: the marker union Int | Float | Bool
 
 DType: TypeAlias = Literal[
     "uint8",

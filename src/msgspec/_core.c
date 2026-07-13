@@ -2979,14 +2979,39 @@ typedef union TypeDetail {
     void *pointer;
 } TypeDetail;
 
+/* `msgspec.data` integer/float format markers, carried on every TypeNode so the
+ * type-directed encoder/decoder can resolve `Int64`/`Float32`/etc. without the
+ * alias in the way. 0 == unspecified (a plain `int`/`float`). */
+enum ms_int_fmt {
+    MS_INT_NONE = 0,
+    MS_INT_INT8, MS_INT_INT16, MS_INT_INT32, MS_INT_INT64,
+    MS_INT_UINT8, MS_INT_UINT16, MS_INT_UINT32, MS_INT_UINT64,
+    MS_INT_INT,   /* generic signed `Int` */
+    MS_INT_UINT,  /* generic unsigned `UInt` */
+};
+enum ms_float_fmt {
+    MS_FLOAT_NONE = 0,
+    MS_FLOAT_FLOAT32, MS_FLOAT_FLOAT64, MS_FLOAT_FLOAT,
+};
+/* The itypes that can exceed JS safe-integer range and so are hex-encoded in
+ * JSON. INT64/INT are signed (explicit +/- sign); UINT64/UINT are unsigned. */
+#define MS_ITYPE_IS_HEX(it) \
+    ((it) == MS_INT_INT64 || (it) == MS_INT_UINT64 || \
+     (it) == MS_INT_INT || (it) == MS_INT_UINT)
+#define MS_ITYPE_IS_SIGNED(it) ((it) == MS_INT_INT64 || (it) == MS_INT_INT)
+
 typedef struct TypeNode {
     uint64_t types;
+    uint8_t itype;   /* enum ms_int_fmt */
+    uint8_t ftype;   /* enum ms_float_fmt */
     TypeDetail details[];
 } TypeNode;
 
 /* A simple extension of TypeNode to allow for static allocation */
 typedef struct {
     uint64_t types;
+    uint8_t itype;
+    uint8_t ftype;
     TypeDetail details[1];
 } TypeNodeSimple;
 
@@ -3608,6 +3633,8 @@ typedef struct {
     MsgspecState *mod;
     PyObject *context;
     uint64_t types;
+    uint8_t itype;   /* enum ms_int_fmt */
+    uint8_t ftype;   /* enum ms_float_fmt */
     PyObject *struct_obj;
     PyObject *struct_info;
     PyObject *structs_set;
@@ -3979,6 +4006,8 @@ typenode_from_collect_state(TypeNodeCollectState *state) {
             return NULL;
         }
         out->types = state->types;
+        out->itype = state->itype;
+        out->ftype = state->ftype;
         return out;
     }
 
@@ -3992,6 +4021,8 @@ typenode_from_collect_state(TypeNodeCollectState *state) {
     }
 
     out->types = state->types;
+    out->itype = state->itype;
+    out->ftype = state->ftype;
     /* Populate `details` fields in order */
     e_ind = 0;
     if (state->tensor_obj != NULL) {
@@ -4931,6 +4962,38 @@ typenode_collect_clear_state(TypeNodeCollectState *state) {
  * - `args`: `__args__` on `t` (if present)
  * - `constraints`: Any constraints from `Meta` objects annotated on the type
  */
+/* If `alias` is one of the `msgspec.data` integer/float format markers
+ * (matched by name), record its format on the collect state. Called just before
+ * a `TypeAliasType` is unwrapped, so the format survives even though the alias
+ * itself resolves away to plain `int`/`float`. */
+static void
+ms_collect_data_fmt(TypeNodeCollectState *state, PyObject *alias) {
+    PyObject *name_obj = PyObject_GetAttrString(alias, "__name__");
+    if (name_obj == NULL) { PyErr_Clear(); return; }
+    const char *name = PyUnicode_AsUTF8(name_obj);
+    if (name == NULL) { PyErr_Clear(); Py_DECREF(name_obj); return; }
+    if (name[0] == 'I' && name[1] == 'n' && name[2] == 't') {
+        if (strcmp(name, "Int") == 0) state->itype = MS_INT_INT;
+        else if (strcmp(name, "Int8") == 0) state->itype = MS_INT_INT8;
+        else if (strcmp(name, "Int16") == 0) state->itype = MS_INT_INT16;
+        else if (strcmp(name, "Int32") == 0) state->itype = MS_INT_INT32;
+        else if (strcmp(name, "Int64") == 0) state->itype = MS_INT_INT64;
+    }
+    else if (name[0] == 'U' && name[1] == 'I') {
+        if (strcmp(name, "UInt") == 0) state->itype = MS_INT_UINT;
+        else if (strcmp(name, "UInt8") == 0) state->itype = MS_INT_UINT8;
+        else if (strcmp(name, "UInt16") == 0) state->itype = MS_INT_UINT16;
+        else if (strcmp(name, "UInt32") == 0) state->itype = MS_INT_UINT32;
+        else if (strcmp(name, "UInt64") == 0) state->itype = MS_INT_UINT64;
+    }
+    else if (name[0] == 'F') {
+        if (strcmp(name, "Float") == 0) state->ftype = MS_FLOAT_FLOAT;
+        else if (strcmp(name, "Float32") == 0) state->ftype = MS_FLOAT_FLOAT32;
+        else if (strcmp(name, "Float64") == 0) state->ftype = MS_FLOAT_FLOAT64;
+    }
+    Py_DECREF(name_obj);
+}
+
 static PyObject *
 typenode_origin_args_metadata(
     TypeNodeCollectState *state, PyObject *obj,
@@ -5051,6 +5114,7 @@ typenode_origin_args_metadata(
             /* Check for TypeAliasType if Python 3.12+ */
         #if PY312_PLUS
             if (Py_TYPE(t) == (PyTypeObject *)(state->mod->typing_typealiastype)) {
+                ms_collect_data_fmt(state, t);
                 PyObject *value = PyObject_GetAttr(t, state->mod->str___value__);
                 if (value == NULL) goto error;
                 Py_DECREF(t);
@@ -10144,6 +10208,7 @@ typedef struct Encoder {
     enum decimal_format decimal_format;
     enum uuid_format uuid_format;
     enum order_mode order;
+    TypeNode *type;  /* from `type=` (type-directed encoding), or NULL */
 } Encoder;
 
 static PyTypeObject Encoder_Type;
@@ -10198,16 +10263,27 @@ ms_write(EncoderState *self, const char *s, Py_ssize_t n)
 static int
 Encoder_init(Encoder *self, PyObject *args, PyObject *kwds)
 {
-    char *kwlist[] = {"enc_hook", "decimal_format", "uuid_format", "order", NULL};
+    char *kwlist[] = {"enc_hook", "decimal_format", "uuid_format", "order", "type", NULL};
     PyObject *enc_hook = NULL, *decimal_format = NULL, *uuid_format = NULL, *order = NULL;
+    PyObject *type = NULL;
 
     if (
         !PyArg_ParseTupleAndKeywords(
-            args, kwds, "|$OOOO", kwlist,
-            &enc_hook, &decimal_format, &uuid_format, &order
+            args, kwds, "|$OOOOO", kwlist,
+            &enc_hook, &decimal_format, &uuid_format, &order, &type
         )
     ) {
         return -1;
+    }
+
+    /* Process type-directed encoding target */
+    if (self->type != NULL) {
+        TypeNode_Free(self->type);
+        self->type = NULL;
+    }
+    if (type != NULL && type != Py_None) {
+        self->type = TypeNode_Convert(type);
+        if (self->type == NULL) return -1;
     }
 
     /* Process decimal format */
@@ -10299,6 +10375,10 @@ Encoder_traverse(Encoder *self, visitproc visit, void *arg)
 {
     Py_VISIT(self->enc_hook);
     Py_VISIT(self->decimal_callable);
+    if (self->type != NULL) {
+        int out = TypeNode_traverse(self->type, visit, arg);
+        if (out != 0) return out;
+    }
     return 0;
 }
 
@@ -10307,6 +10387,10 @@ Encoder_clear(Encoder *self)
 {
     Py_CLEAR(self->enc_hook);
     Py_CLEAR(self->decimal_callable);
+    if (self->type != NULL) {
+        TypeNode_Free(self->type);
+        self->type = NULL;
+    }
     return 0;
 }
 
@@ -10421,7 +10505,8 @@ encoder_encode_common(
     Encoder *self,
     PyObject *const *args,
     Py_ssize_t nargs,
-    int(*encode)(EncoderState*, PyObject*)
+    int(*encode)(EncoderState*, PyObject*),
+    int(*typed_encode)(EncoderState*, PyObject*, TypeNode*)
 )
 {
     if (!check_positional_nargs(nargs, 1, 1)) return NULL;
@@ -10442,7 +10527,10 @@ encoder_encode_common(
     if (state.output_buffer == NULL) return NULL;
     state.output_buffer_raw = PyBytes_AS_STRING(state.output_buffer);
 
-    if (encode(&state, args[0]) < 0) {
+    int status = (self->type != NULL)
+        ? typed_encode(&state, args[0], self->type)
+        : encode(&state, args[0]);
+    if (status < 0) {
         Py_DECREF(state.output_buffer);
         return NULL;
     }
@@ -10456,10 +10544,11 @@ encode_common(
     PyObject *const *args,
     Py_ssize_t nargs,
     PyObject *kwnames,
-    int(*encode)(EncoderState*, PyObject*)
+    int(*encode)(EncoderState*, PyObject*),
+    int(*typed_encode)(EncoderState*, PyObject*, TypeNode*)
 )
 {
-    PyObject *enc_hook = NULL, *order = NULL;
+    PyObject *enc_hook = NULL, *order = NULL, *type = NULL;
     MsgspecState *mod = msgspec_get_state(module);
 
     /* Parse arguments */
@@ -10468,6 +10557,7 @@ encode_common(
         Py_ssize_t nkwargs = PyTuple_GET_SIZE(kwnames);
         if ((enc_hook = find_keyword(kwnames, args + nargs, mod->str_enc_hook)) != NULL) nkwargs--;
         if ((order = find_keyword(kwnames, args + nargs, mod->str_order)) != NULL) nkwargs--;
+        if ((type = find_keyword(kwnames, args + nargs, mod->str_type)) != NULL) nkwargs--;
         if (nkwargs > 0) {
             PyErr_SetString(
                 PyExc_TypeError,
@@ -10504,7 +10594,20 @@ encode_common(
     if (state.output_buffer == NULL) return NULL;
     state.output_buffer_raw = PyBytes_AS_STRING(state.output_buffer);
 
-    if (encode(&state, args[0]) < 0) {
+    int status;
+    if (type != NULL && type != Py_None) {
+        TypeNode *typenode = TypeNode_Convert(type);
+        if (typenode == NULL) {
+            Py_DECREF(state.output_buffer);
+            return NULL;
+        }
+        status = typed_encode(&state, args[0], typenode);
+        TypeNode_Free(typenode);
+    }
+    else {
+        status = encode(&state, args[0]);
+    }
+    if (status < 0) {
         Py_DECREF(state.output_buffer);
         return NULL;
     }
@@ -14400,6 +14503,203 @@ mpack_encode(EncoderState *self, PyObject *obj) {
     return mpack_encode_inline(self, obj);
 }
 
+/* --- Type-directed MessagePack encoding (opt-in via `type=`) --------------
+ *
+ * MessagePack integers are already exact, so this is byte-identical to the
+ * value-directed path apart from one leaf: a `Float32`-typed float narrows to a
+ * 5-byte float32. Containers are walked to reach nested float32 leaves. */
+
+static int mpack_encode_typed(EncoderState *, PyObject *, TypeNode *);
+
+static int
+mpack_encode_float32(EncoderState *self, PyObject *obj) {
+    char buf[5];
+    float x = (float)PyFloat_AS_DOUBLE(obj);
+    uint32_t ux;
+    memcpy(&ux, &x, 4);
+    buf[0] = MP_FLOAT32;
+    _msgspec_store32(&buf[1], ux);
+    return ms_write(self, buf, 5);
+}
+
+static int
+mpack_encode_seq_typed(EncoderState *self, Py_ssize_t size, PyObject **arr, TypeNode *item) {
+    if (size == 0) return mpack_encode_empty_array(self);
+    if (mpack_encode_array_header(self, size, "list") < 0) return -1;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = 0;
+    for (Py_ssize_t i = 0; i < size; i++) {
+        if (mpack_encode_typed(self, arr[i], item) < 0) { status = -1; break; }
+    }
+    Py_LeaveRecursiveCall();
+    return status;
+}
+
+static int
+mpack_encode_set_typed(EncoderState *self, PyObject *obj, TypeNode *item) {
+    Py_ssize_t len = PySet_GET_SIZE(obj);
+    if (len == 0) return mpack_encode_empty_array(self);
+    if (MS_UNLIKELY(self->order != ORDER_DEFAULT)) return mpack_encode_set(self, obj);
+    if (mpack_encode_array_header(self, len, "set") < 0) return -1;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    PyObject *it = PyObject_GetIter(obj), *el;
+    if (it == NULL) goto cleanup;
+    while ((el = PyIter_Next(it))) {
+        int s = mpack_encode_typed(self, el, item);
+        Py_DECREF(el);
+        if (s < 0) goto cleanup;
+    }
+    status = 0;
+cleanup:
+    Py_LeaveRecursiveCall();
+    Py_XDECREF(it);
+    return status;
+}
+
+static int
+mpack_encode_dict_typed(EncoderState *self, PyObject *obj, TypeNode *vtype) {
+    Py_ssize_t len = PyDict_GET_SIZE(obj), pos = 0;
+    if (len == 0) { char h[1] = {MP_FIXMAP}; return ms_write(self, h, 1); }
+    if (MS_UNLIKELY(self->order != ORDER_DEFAULT)) return mpack_encode_dict(self, obj);
+    if (mpack_encode_map_header(self, len, "dicts") < 0) return -1;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    PyObject *key, *val;
+    Py_BEGIN_CRITICAL_SECTION(obj);
+    while (PyDict_Next(obj, &pos, &key, &val)) {
+        if (mpack_encode_dict_key_inline(self, key) < 0) goto cleanup;
+        if (mpack_encode_typed(self, val, vtype) < 0) goto cleanup;
+    }
+    status = 0;
+cleanup:;
+    Py_END_CRITICAL_SECTION();
+    Py_LeaveRecursiveCall();
+    return status;
+}
+
+static int
+mpack_encode_struct_object_typed(
+    EncoderState *self, StructMetaObject *st, PyObject *obj, StructInfo *info
+) {
+    PyObject *tag_value = st->struct_tag_value;
+    int tagged = tag_value != NULL;
+    PyObject *fields = st->struct_encode_fields;
+    Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
+    Py_ssize_t len = nfields + tagged;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    Py_ssize_t header_offset = self->output_len;
+    if (mpack_encode_map_header(self, len, "structs") < 0) goto cleanup;
+    if (tagged) {
+        if (mpack_encode_str(self, st->struct_tag_field) < 0) goto cleanup;
+        if (mpack_encode(self, tag_value) < 0) goto cleanup;
+    }
+    Py_ssize_t nunchecked = nfields, actual_len = len;
+    if (st->omit_defaults == OPT_TRUE) nunchecked -= PyTuple_GET_SIZE(st->struct_defaults);
+    for (Py_ssize_t i = 0; i < nfields; i++) {
+        PyObject *val = Struct_get_index(obj, i);
+        if (MS_UNLIKELY(val == NULL)) goto cleanup;
+        bool omit = (val == UNSET);
+        if (!omit && i >= nunchecked) {
+            PyObject *dflt = PyTuple_GET_ITEM(st->struct_defaults, i - nunchecked);
+            if (is_default(val, dflt)) omit = true;
+        }
+        if (omit) { actual_len--; continue; }
+        if (mpack_encode_str(self, PyTuple_GET_ITEM(fields, i)) < 0) goto cleanup;
+        if (mpack_encode_typed(self, val, info->types[i]) < 0) goto cleanup;
+    }
+    if (MS_UNLIKELY(actual_len != len)) {
+        char *header_loc = self->output_buffer_raw + header_offset;
+        if (len < 16) { *header_loc = MP_FIXMAP | actual_len; }
+        else if (len < (1 << 16)) { *header_loc++ = MP_MAP16; _msgspec_store16(header_loc, (uint16_t)actual_len); }
+        else { *header_loc++ = MP_MAP32; _msgspec_store32(header_loc, (uint32_t)actual_len); }
+    }
+    status = 0;
+cleanup:
+    Py_LeaveRecursiveCall();
+    return status;
+}
+
+static int
+mpack_encode_struct_array_typed(
+    EncoderState *self, StructMetaObject *st, PyObject *obj, StructInfo *info
+) {
+    PyObject *tag_value = st->struct_tag_value;
+    int tagged = tag_value != NULL;
+    PyObject *fields = st->struct_encode_fields;
+    Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
+    Py_ssize_t len = nfields + tagged;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    if (mpack_encode_array_header(self, len, "structs") < 0) goto cleanup;
+    if (tagged) {
+        if (mpack_encode(self, tag_value) < 0) goto cleanup;
+    }
+    for (Py_ssize_t i = 0; i < nfields; i++) {
+        PyObject *val = Struct_get_index(obj, i);
+        if (val == NULL || mpack_encode_typed(self, val, info->types[i]) < 0) goto cleanup;
+    }
+    status = 0;
+cleanup:
+    Py_LeaveRecursiveCall();
+    return status;
+}
+
+static int
+mpack_encode_struct_typed(EncoderState *self, PyObject *obj) {
+    StructMetaObject *st = (StructMetaObject *)Py_TYPE(obj);
+    if (MS_UNLIKELY(self->order == ORDER_SORTED)) return mpack_encode_struct(self, obj);
+    PyObject *info_obj = StructInfo_Convert((PyObject *)st);
+    if (info_obj == NULL) return -1;
+    StructInfo *info = (StructInfo *)info_obj;
+    int status = (st->array_like == OPT_TRUE)
+        ? mpack_encode_struct_array_typed(self, st, obj, info)
+        : mpack_encode_struct_object_typed(self, st, obj, info);
+    Py_DECREF(info_obj);
+    return status;
+}
+
+static int
+mpack_encode_typed(EncoderState *self, PyObject *obj, TypeNode *type) {
+    if (type == NULL) return mpack_encode(self, obj);
+    uint64_t t = type->types;
+    PyTypeObject *pt = Py_TYPE(obj);
+
+    if (pt == &PyFloat_Type && (t & MS_TYPE_FLOAT) && type->ftype == MS_FLOAT_FLOAT32) {
+        return mpack_encode_float32(self, obj);
+    }
+    if (ms_is_struct_type(pt)) {
+        return mpack_encode_struct_typed(self, obj);
+    }
+    if (pt == &PyList_Type && (t & MS_TYPE_LIST)) {
+        int r;
+        Py_BEGIN_CRITICAL_SECTION(obj);
+        r = mpack_encode_seq_typed(
+            self, PyList_GET_SIZE(obj), ((PyListObject *)obj)->ob_item,
+            TypeNode_get_array(type)
+        );
+        Py_END_CRITICAL_SECTION();
+        return r;
+    }
+    if (pt == &PyTuple_Type && (t & MS_TYPE_VARTUPLE)) {
+        return mpack_encode_seq_typed(
+            self, PyTuple_GET_SIZE(obj), ((PyTupleObject *)obj)->ob_item,
+            TypeNode_get_array(type)
+        );
+    }
+    if ((pt == &PySet_Type || pt == &PyFrozenSet_Type)
+            && (t & (MS_TYPE_SET | MS_TYPE_FROZENSET))) {
+        return mpack_encode_set_typed(self, obj, TypeNode_get_array(type));
+    }
+    if (pt == &PyDict_Type && (t & MS_ANY_DICT)) {
+        TypeNode *ktype, *vtype;
+        TypeNode_get_dict(type, &ktype, &vtype);
+        return mpack_encode_dict_typed(self, obj, vtype);
+    }
+    return mpack_encode(self, obj);
+}
+
 static PyObject*
 Encoder_encode_into(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
 {
@@ -14409,7 +14709,7 @@ Encoder_encode_into(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
 static PyObject*
 Encoder_encode(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
 {
-    return encoder_encode_common(self, args, nargs, &mpack_encode);
+    return encoder_encode_common(self, args, nargs, &mpack_encode, &mpack_encode_typed);
 }
 
 static struct PyMethodDef Encoder_methods[] = {
@@ -14479,7 +14779,7 @@ PyDoc_STRVAR(msgspec_msgpack_encode__doc__,
 static PyObject*
 msgspec_msgpack_encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
 {
-    return encode_common(self, args, nargs, kwnames, &mpack_encode);
+    return encode_common(self, args, nargs, kwnames, &mpack_encode, &mpack_encode_typed);
 }
 
 /*************************************************************************
@@ -15415,6 +15715,258 @@ json_encode_struct(EncoderState *self, PyObject *obj)
     return json_encode_struct_object(self, struct_type, obj);
 }
 
+/* --- Type-directed JSON encoding (opt-in via `type=`) ---------------------
+ *
+ * Produces identical bytes to the value-directed path except at integer leaves
+ * whose itype is a 64-bit/generic marker (Int64/UInt64/Int/UInt): those are
+ * hex-encoded as a string when they'd exceed the JS safe-integer range, so they
+ * round-trip losslessly through JavaScript. `force_hex` (a Scalar-style
+ * `Int|Float` union) always hex-encodes so the wire form is unambiguous. */
+
+static int json_encode_typed(EncoderState *, PyObject *, TypeNode *);
+
+#define MS_JS_SAFE_INT_MAX 0x1FFFFFFFFFFFFFULL  /* 2**53 - 1 */
+
+static int
+json_encode_int_hex(EncoderState *self, PyObject *obj, uint8_t itype, bool force_hex) {
+    uint64_t x;
+    bool neg, overflow;
+    overflow = fast_long_extract_parts(obj, &neg, &x);
+    if (!force_hex && !overflow && x <= MS_JS_SAFE_INT_MAX) {
+        /* Fits the JS safe-integer range: a plain JSON number. */
+        return json_encode_long(self, obj);
+    }
+    char prefix[4];
+    int plen = 0;
+    prefix[plen++] = '"';
+    if (MS_ITYPE_IS_SIGNED(itype)) prefix[plen++] = neg ? '-' : '+';
+    prefix[plen++] = '0';
+    prefix[plen++] = 'x';
+    if (ms_write(self, prefix, plen) < 0) return -1;
+    if (!overflow) {
+        char hex[16], tmp[16];
+        int n = 0, ti = 0;
+        uint64_t v = x;
+        do {
+            int d = v & 0xf;
+            tmp[ti++] = d < 10 ? ('0' + d) : ('a' + d - 10);
+            v >>= 4;
+        } while (v);
+        while (ti) hex[n++] = tmp[--ti];
+        if (ms_write(self, hex, n) < 0) return -1;
+    }
+    else {
+        /* Beyond 64 bits (generic Int only). Use Python's hex of the magnitude. */
+        PyObject *absv = neg ? PyNumber_Absolute(obj) : obj;
+        if (absv == NULL) return -1;
+        PyObject *hexstr = PyNumber_ToBase(absv, 16);  /* e.g. "0x1a2b" */
+        if (neg) Py_DECREF(absv);
+        if (hexstr == NULL) return -1;
+        Py_ssize_t hlen;
+        const char *hbuf = unicode_str_and_size(hexstr, &hlen);
+        int status = (hbuf == NULL) ? -1 : ms_write(self, hbuf + 2, hlen - 2);
+        Py_DECREF(hexstr);
+        if (status < 0) return -1;
+    }
+    return ms_write(self, "\"", 1);
+}
+
+static int
+json_encode_seq_typed(EncoderState *self, Py_ssize_t size, PyObject **arr, TypeNode *item) {
+    if (size == 0) return ms_write(self, "[]", 2);
+    if (ms_write(self, "[", 1) < 0) return -1;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    for (Py_ssize_t i = 0; i < size; i++) {
+        if (json_encode_typed(self, arr[i], item) < 0) goto cleanup;
+        if (ms_write(self, ",", 1) < 0) goto cleanup;
+    }
+    *(self->output_buffer_raw + self->output_len - 1) = ']';
+    status = 0;
+cleanup:
+    Py_LeaveRecursiveCall();
+    return status;
+}
+
+static int
+json_encode_set_typed(EncoderState *self, PyObject *obj, TypeNode *item) {
+    if (PySet_GET_SIZE(obj) == 0) return ms_write(self, "[]", 2);
+    if (MS_UNLIKELY(self->order != ORDER_DEFAULT)) return json_encode_set(self, obj);
+    if (ms_write(self, "[", 1) < 0) return -1;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    PyObject *it = PyObject_GetIter(obj), *el;
+    if (it == NULL) goto cleanup;
+    while ((el = PyIter_Next(it))) {
+        int s = json_encode_typed(self, el, item);
+        Py_DECREF(el);
+        if (s < 0) goto cleanup;
+        if (ms_write(self, ",", 1) < 0) goto cleanup;
+    }
+    *(self->output_buffer_raw + self->output_len - 1) = ']';
+    status = 0;
+cleanup:
+    Py_LeaveRecursiveCall();
+    Py_XDECREF(it);
+    return status;
+}
+
+static int
+json_encode_dict_typed(EncoderState *self, PyObject *obj, TypeNode *vtype) {
+    Py_ssize_t pos = 0;
+    if (PyDict_GET_SIZE(obj) == 0) return ms_write(self, "{}", 2);
+    if (MS_UNLIKELY(self->order != ORDER_DEFAULT)) return json_encode_dict(self, obj);
+    if (ms_write(self, "{", 1) < 0) return -1;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    PyObject *key, *val;
+    Py_BEGIN_CRITICAL_SECTION(obj);
+    while (PyDict_Next(obj, &pos, &key, &val)) {
+        if (json_encode_dict_key(self, key) < 0) goto cleanup;
+        if (ms_write(self, ":", 1) < 0) goto cleanup;
+        if (json_encode_typed(self, val, vtype) < 0) goto cleanup;
+        if (ms_write(self, ",", 1) < 0) goto cleanup;
+    }
+    *(self->output_buffer_raw + self->output_len - 1) = '}';
+    status = 0;
+cleanup:;
+    Py_END_CRITICAL_SECTION();
+    Py_LeaveRecursiveCall();
+    return status;
+}
+
+static int
+json_encode_struct_object_typed(
+    EncoderState *self, StructMetaObject *st, PyObject *obj, StructInfo *info
+) {
+    PyObject *fields = st->struct_encode_fields;
+    PyObject *defaults = st->struct_defaults;
+    Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
+    Py_ssize_t nunchecked = nfields;
+    if (st->omit_defaults == OPT_TRUE) nunchecked -= PyTuple_GET_SIZE(defaults);
+    if (ms_write(self, "{", 1) < 0) return -1;
+    Py_ssize_t start_len = self->output_len;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    if (st->struct_tag_value != NULL) {
+        if (json_encode_str(self, st->struct_tag_field) < 0) goto cleanup;
+        if (ms_write(self, ":", 1) < 0) goto cleanup;
+        if (json_encode_struct_tag(self, st->struct_tag_value) < 0) goto cleanup;
+        if (ms_write(self, ",", 1) < 0) goto cleanup;
+    }
+    for (Py_ssize_t i = 0; i < nfields; i++) {
+        PyObject *key = PyTuple_GET_ITEM(fields, i);
+        PyObject *val = Struct_get_index(obj, i);
+        if (MS_UNLIKELY(val == NULL)) goto cleanup;
+        if (MS_UNLIKELY(val == UNSET)) continue;
+        if (i >= nunchecked) {
+            PyObject *default_val = PyTuple_GET_ITEM(defaults, i - nunchecked);
+            if (is_default(val, default_val)) continue;
+        }
+        if (json_encode_str_noescape(self, key) < 0) goto cleanup;
+        if (ms_write(self, ":", 1) < 0) goto cleanup;
+        if (json_encode_typed(self, val, info->types[i]) < 0) goto cleanup;
+        if (ms_write(self, ",", 1) < 0) goto cleanup;
+    }
+    if (start_len == self->output_len) { if (ms_write(self, "}", 1) < 0) goto cleanup; }
+    else { *(self->output_buffer_raw + self->output_len - 1) = '}'; }
+    status = 0;
+cleanup:
+    Py_LeaveRecursiveCall();
+    return status;
+}
+
+static int
+json_encode_struct_array_typed(
+    EncoderState *self, StructMetaObject *st, PyObject *obj, StructInfo *info
+) {
+    PyObject *tag_value = st->struct_tag_value;
+    PyObject *fields = st->struct_encode_fields;
+    Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
+    if (nfields == 0 && tag_value == NULL) return ms_write(self, "[]", 2);
+    if (ms_write(self, "[", 1) < 0) return -1;
+    if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
+    int status = -1;
+    if (tag_value != NULL) {
+        if (json_encode_struct_tag(self, tag_value) < 0) goto cleanup;
+        if (ms_write(self, ",", 1) < 0) goto cleanup;
+    }
+    for (Py_ssize_t i = 0; i < nfields; i++) {
+        PyObject *val = Struct_get_index(obj, i);
+        if (val == NULL) goto cleanup;
+        if (json_encode_typed(self, val, info->types[i]) < 0) goto cleanup;
+        if (ms_write(self, ",", 1) < 0) goto cleanup;
+    }
+    *(self->output_buffer_raw + self->output_len - 1) = ']';
+    status = 0;
+cleanup:
+    Py_LeaveRecursiveCall();
+    return status;
+}
+
+static int
+json_encode_struct_typed(EncoderState *self, PyObject *obj) {
+    StructMetaObject *st = (StructMetaObject *)Py_TYPE(obj);
+    /* The sorted-order path uses a separate AssocList machinery; fall back to
+     * value-directed there (its int fields won't be hex-encoded). */
+    if (MS_UNLIKELY(self->order == ORDER_SORTED)) return json_encode_struct(self, obj);
+    PyObject *info_obj = StructInfo_Convert((PyObject *)st);
+    if (info_obj == NULL) return -1;
+    StructInfo *info = (StructInfo *)info_obj;
+    int status;
+    if (st->array_like == OPT_TRUE)
+        status = json_encode_struct_array_typed(self, st, obj, info);
+    else
+        status = json_encode_struct_object_typed(self, st, obj, info);
+    Py_DECREF(info_obj);
+    return status;
+}
+
+static int
+json_encode_typed(EncoderState *self, PyObject *obj, TypeNode *type) {
+    if (type == NULL) return json_encode(self, obj);
+    uint64_t t = type->types;
+    PyTypeObject *pt = Py_TYPE(obj);
+
+    if (pt == &PyLong_Type && (t & MS_TYPE_INT) && MS_ITYPE_IS_HEX(type->itype)) {
+        /* In a Scalar-style `Int | Float` union a bare number is ambiguous, so
+         * always hex-encode the integer. */
+        bool force_hex = (t & MS_TYPE_FLOAT) != 0;
+        return json_encode_int_hex(self, obj, type->itype, force_hex);
+    }
+    if (ms_is_struct_type(pt)) {
+        return json_encode_struct_typed(self, obj);
+    }
+    if (pt == &PyList_Type && (t & MS_TYPE_LIST)) {
+        int r;
+        Py_BEGIN_CRITICAL_SECTION(obj);
+        r = json_encode_seq_typed(
+            self, PyList_GET_SIZE(obj), ((PyListObject *)obj)->ob_item,
+            TypeNode_get_array(type)
+        );
+        Py_END_CRITICAL_SECTION();
+        return r;
+    }
+    if (pt == &PyTuple_Type && (t & MS_TYPE_VARTUPLE)) {
+        return json_encode_seq_typed(
+            self, PyTuple_GET_SIZE(obj), ((PyTupleObject *)obj)->ob_item,
+            TypeNode_get_array(type)
+        );
+    }
+    if ((pt == &PySet_Type || pt == &PyFrozenSet_Type)
+            && (t & (MS_TYPE_SET | MS_TYPE_FROZENSET))) {
+        return json_encode_set_typed(self, obj, TypeNode_get_array(type));
+    }
+    if (pt == &PyDict_Type && (t & MS_ANY_DICT)) {
+        TypeNode *ktype, *vtype;
+        TypeNode_get_dict(type, &ktype, &vtype);
+        return json_encode_dict_typed(self, obj, vtype);
+    }
+    /* Everything else (str/bytes/float/fixtuple/enum/...) is byte-identical to
+     * the value-directed path. */
+    return json_encode(self, obj);
+}
+
 static MS_NOINLINE int
 json_encode_uncommon(EncoderState *self, PyTypeObject *type, PyObject *obj) {
     if (obj == Py_None) {
@@ -15556,7 +16108,7 @@ JSONEncoder_encode_into(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
 static PyObject*
 JSONEncoder_encode(Encoder *self, PyObject *const *args, Py_ssize_t nargs)
 {
-    return encoder_encode_common(self, args, nargs, &json_encode);
+    return encoder_encode_common(self, args, nargs, &json_encode, &json_encode_typed);
 }
 
 PyDoc_STRVAR(JSONEncoder_encode_lines__doc__,
@@ -15704,7 +16256,7 @@ PyDoc_STRVAR(msgspec_json_encode__doc__,
 static PyObject*
 msgspec_json_encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
 {
-    return encode_common(self, args, nargs, kwnames, &json_encode);
+    return encode_common(self, args, nargs, kwnames, &json_encode, &json_encode_typed);
 }
 
 /*************************************************************************
@@ -18638,12 +19190,55 @@ invalid:
     return ms_error_with_path("Invalid base64 encoded string%U", path);
 }
 
+/* A JSON string in a hex-int position (Int64/UInt64/Int/UInt). Returns the
+ * parsed int, or NULL. `*is_hex` is set true if the string matched the expected
+ * hex shape (signed itypes require a leading `+`/`-`, unsigned a bare `0x`); if
+ * false, the caller should fall through (e.g. to a `str` branch in a union). */
+static PyObject *
+json_maybe_decode_hex_int(
+    const char *view, Py_ssize_t size, TypeNode *type, PathNode *path, bool *is_hex
+) {
+    *is_hex = false;
+    bool signed_ = MS_ITYPE_IS_SIGNED(type->itype);
+    Py_ssize_t off = 0;
+    if (signed_) {
+        if (size < 3 || (view[0] != '+' && view[0] != '-')) return NULL;
+        off = 1;
+    }
+    if (size < off + 2 || view[off] != '0' || (view[off + 1] | 0x20) != 'x') return NULL;
+    *is_hex = true;
+
+    char stackbuf[48];
+    char *buf = stackbuf;
+    if (size + 1 > (Py_ssize_t)sizeof(stackbuf)) {
+        buf = PyMem_Malloc(size + 1);
+        if (buf == NULL) { PyErr_NoMemory(); return NULL; }
+    }
+    memcpy(buf, view, size);
+    buf[size] = '\0';
+    PyObject *num = PyLong_FromString(buf, NULL, 16);
+    if (buf != stackbuf) PyMem_Free(buf);
+    if (num == NULL) {
+        PyErr_Clear();
+        return ms_validation_error("int", type, path);
+    }
+    return num;
+}
+
 static PyObject *
 json_decode_string(JSONDecoderState *self, TypeNode *type, PathNode *path) {
     char *view = NULL;
     bool is_ascii = true;
     Py_ssize_t size = json_decode_string_view(self, &view, &is_ascii);
     if (size < 0) return NULL;
+
+    /* A hex-encoded 64-bit/generic int arriving as a string (checked before the
+     * `str` branch so `Int64 | str` unions disambiguate on the hex shape). */
+    if (MS_UNLIKELY((type->types & MS_TYPE_INT) && MS_ITYPE_IS_HEX(type->itype))) {
+        bool is_hex;
+        PyObject *out = json_maybe_decode_hex_int(view, size, type, path, &is_hex);
+        if (is_hex) return out;
+    }
 
     if (MS_LIKELY(type->types & (MS_TYPE_STR | MS_TYPE_ANY))) {
         PyObject *out;

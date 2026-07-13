@@ -285,20 +285,21 @@ def test_typealias_generic_specializations_distinct():
 def test_data_scalar_aliases():
     from msgspec import data as md
 
-    # Every dtype alias resolves to a ScalarType with its dtype string.
-    for alias, name in [
-        (md.UInt8, "uint8"),
-        (md.Int64, "int64"),
-        (md.Float32, "float32"),
-        (md.Float64, "float64"),
-        (md.Bool, "bool"),
-    ]:
-        assert mi.type_info(alias) == mi.ScalarType(dtype=name)
-    # The dtype-agnostic `Scalar` resolves to ScalarType(None).
-    assert mi.type_info(md.Scalar) == mi.ScalarType(dtype=None)
-    # `Int`/`Float` are the generic markers -> int64 / float64.
-    assert mi.type_info(md.Int) == mi.ScalarType(dtype="int64")
-    assert mi.type_info(md.Float) == mi.ScalarType(dtype="float64")
+    # Integer/float markers carry their format inline on IntType/FloatType.
+    assert mi.type_info(md.UInt8) == mi.IntType(itype="uint8")
+    assert mi.type_info(md.Int64) == mi.IntType(itype="int64")
+    assert mi.type_info(md.Float32) == mi.FloatType(ftype="float32")
+    assert mi.type_info(md.Float64) == mi.FloatType(ftype="float64")
+    # `Bool` is just a bool.
+    assert mi.type_info(md.Bool) == mi.BoolType()
+    # The generic markers.
+    assert mi.type_info(md.Int) == mi.IntType(itype="int")
+    assert mi.type_info(md.UInt) == mi.IntType(itype="uint")
+    assert mi.type_info(md.Float) == mi.FloatType(ftype="float")
+    # `Scalar` is the accurate-scalar union `Int | Float | Bool`.
+    assert mi.type_info(md.Scalar) == mi.UnionType(
+        (mi.IntType(itype="int"), mi.FloatType(ftype="float"), mi.BoolType())
+    )
 
 
 def test_data_int_float_in_tensors():
@@ -316,7 +317,7 @@ def test_data_scalar_alias_recognized_regardless_of_aliases_flag():
     from msgspec import data as md
 
     # data scalars take precedence over generic alias handling.
-    assert mi.type_info(md.Int32, aliases=True) == mi.ScalarType(dtype="int32")
+    assert mi.type_info(md.Int32, aliases=True) == mi.IntType(itype="int32")
 
 
 def test_unrelated_alias_not_treated_as_scalar():
@@ -353,8 +354,10 @@ def test_data_types_as_struct_fields():
 
     info = mi.type_info(Layer)
     assert info.fields[0].type == mi.TensorType(ndims=3, sizes=None, dtype="float32")
-    assert info.fields[1].type == mi.ScalarType(dtype=None)
-    assert info.fields[2].type == mi.ScalarType(dtype="int64")
+    assert info.fields[1].type == mi.UnionType(
+        (mi.IntType(itype="int"), mi.FloatType(ftype="float"), mi.BoolType())
+    )
+    assert info.fields[2].type == mi.IntType(itype="int64")
 
 
 def test_final():

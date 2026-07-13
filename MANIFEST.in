@@ -7,3 +7,8 @@ prune scripts
 exclude lychee.toml
 exclude .*
 include .cibuildwheel.toml
+
+# The `msgspec.javascript` bundle - shipped so it can be copied into the wheel.
+recursive-include javascript/src *.mjs
+include javascript/package.json
+include javascript/README.md

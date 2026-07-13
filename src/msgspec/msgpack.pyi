@@ -87,6 +87,7 @@ class Encoder:
         decimal_format: _DecimalFormatSig = "string",
         uuid_format: Literal["canonical", "hex", "bytes"] = "canonical",
         order: Literal["deterministic", "sorted"] | None = None,
+        type: Any = None,
     ) -> None: ...
     def encode(self, obj: Any, /) -> bytes: ...
     def encode_into(
@@ -121,4 +122,5 @@ def encode(
     *,
     enc_hook: _EncHookSig = None,
     order: Literal["deterministic", "sorted"] | None = None,
+    type: Any = None,
 ) -> bytes: ...

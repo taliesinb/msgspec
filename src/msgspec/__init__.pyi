@@ -17,7 +17,7 @@ from typing import (
 
 from typing_extensions import Buffer, Self, dataclass_transform
 
-from . import inspect, json, msgpack, structs, toml, typescript, yaml, data
+from . import inspect, javascript, json, msgpack, structs, toml, typescript, yaml, data
 
 # PEP 673 explicitly rejects using Self in metaclass definitions:
 # https://peps.python.org/pep-0673/#valid-locations-for-self

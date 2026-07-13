@@ -271,6 +271,7 @@ def test_abstract_typescript_codec_dispatch(zoo):
     Animal, Cat, Dog = zoo
     out = msgspec.typescript.codec(Animal)
     assert "export type Animal = Cat | Dog;" in out
-    assert "export function encode(value: Animal): Uint8Array" in out
-    assert 'case "cat": return decodeCat(v);' in out
-    assert 'case "dog": return decodeDog(v);' in out
+    assert "encode(value: Animal): Uint8Array" in out
+    assert "export const msgpack = {" in out
+    assert "case \"cat\": return decodeCat(r);" in out
+    assert "case \"dog\": return decodeDog(r);" in out

@@ -192,7 +192,9 @@ few:
     converters.rst
     jsonschema.rst
     typescript.rst
+    javascript.rst
     tensors.rst
+    type-directed-encoding.rst
     schema-evolution.rst
 
 .. toctree::

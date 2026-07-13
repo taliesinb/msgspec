@@ -6,29 +6,21 @@ from collections.abc import Iterable
 from typing import Any
 
 from . import inspect as mi
+from ._msgpack_runtime_ts import RUNTIME as _MSGPACK_RUNTIME_TS
 
 __all__ = ("schema", "schema_components", "codec")
+
+
+def _ts_sig_swap(src: str, js_sig: str, ts_sig: str) -> str:
+    """Retype a JS function definition's signature line (its body is valid TS)."""
+    return src.replace(
+        f"export function {js_sig} {{", f"export function {ts_sig} {{", 1
+    )
 
 # Matches a valid (unquoted) TypeScript identifier.
 _IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 
 _INDENT = "  "
-
-# TypeScript representation of a `msgspec.data` scalar dtype. 64-bit integers
-# exceed JS number precision so map to `bigint`.
-_DTYPE_TS_SCALAR = {
-    "int8": "number",
-    "int16": "number",
-    "int32": "number",
-    "uint8": "number",
-    "uint16": "number",
-    "uint32": "number",
-    "float32": "number",
-    "float64": "number",
-    "int64": "bigint",
-    "uint64": "bigint",
-    "bool": "boolean",
-}
 
 # TypeScript typed-array for a packed tensor of a given dtype. TS has no bit-
 # packed boolean array, so `bool` uses `Uint8Array`.
@@ -255,8 +247,12 @@ def _jsdoc(doc: str) -> str:
 
 
 class _SchemaGenerator:
-    def __init__(self, name_map: dict[Any, str]):
+    def __init__(self, name_map: dict[Any, str], embed: bool = False):
         self.name_map = name_map
+        # In the embedded codec the in-memory value for `bytes` is a
+        # `Uint8Array` (base64 only appears on the JSON wire), so the type must
+        # reflect that rather than the `string` used by the schema.
+        self.embed = embed
 
     def to_ref(self, t: mi.Type) -> str:
         """Render a Type as an inline TypeScript type reference."""
@@ -278,8 +274,14 @@ class _SchemaGenerator:
             return "null"
         elif isinstance(t, mi.BoolType):
             return "boolean"
-        elif isinstance(t, (mi.IntType, mi.FloatType)):
+        elif isinstance(t, mi.IntType):
+            return "bigint" if _is_bigint(t) else "number"
+        elif isinstance(t, mi.FloatType):
             return "number"
+        elif self.embed and isinstance(
+            t, (mi.BytesType, mi.ByteArrayType, mi.MemoryViewType)
+        ):
+            return "Uint8Array"
         elif isinstance(
             t,
             (
@@ -313,8 +315,6 @@ class _SchemaGenerator:
             if key not in ("string", "number"):
                 key = "string"
             return f"Record<{key}, {self.to_ref(t.value_type)}>"
-        elif isinstance(t, mi.ScalarType):
-            return _scalar_ts(t)
         elif isinstance(t, mi.TensorType):
             # A packed tensor -> a typed array, dispatched on dtype. TypeScript
             # can't express rank/shape, so ndims/sizes are dropped. dtype `None`
@@ -387,13 +387,14 @@ class _SchemaGenerator:
 
 
 # Types whose TypeScript value is already exactly the MessagePack wire value, so
-# encoding/decoding is the identity (no transform needed).
+# encoding/decoding is the identity (no transform needed). `IntType`/`FloatType`
+# are handled separately in `_is_identity`, since a 64-bit `IntType` maps to
+# `bigint` and needs a conversion.
 _SCALAR_IDENTITY = (
     mi.AnyType,
     mi.RawType,
     mi.NoneType,
     mi.BoolType,
-    mi.IntType,
     mi.FloatType,
     mi.StrType,
     mi.BytesType,
@@ -409,13 +410,15 @@ _SCALAR_IDENTITY = (
     mi.LiteralType,
 )
 
+# The `msgspec.data` integer formats that map to a JavaScript `bigint`.
+_BIGINT_ITYPES = frozenset({"int64", "uint64", "int", "uint"})
 
-def _scalar_ts(t: mi.ScalarType) -> str:
-    """The TypeScript type for a `msgspec.data` scalar. dtype `None` (`Scalar`)
-    is any scalar; 64-bit integer dtypes map to `bigint`."""
-    if t.dtype is None:
-        return "number | boolean"
-    return _DTYPE_TS_SCALAR[t.dtype]
+
+def _is_bigint(t: mi.Type) -> bool:
+    """Whether an `IntType` maps to a JavaScript `bigint` (a 64-bit or generic
+    integer marker) rather than a `number`."""
+    return isinstance(t, mi.IntType) and t.itype in _BIGINT_ITYPES
+
 
 # Object/tuple-like components that get a generated encode/decode function pair.
 _CODEC_FUNC_TYPES = (
@@ -433,10 +436,10 @@ def _is_identity(t: mi.Type) -> bool:
         t = t.type
     if isinstance(t, _SCALAR_IDENTITY):
         return True
-    if isinstance(t, mi.ScalarType):
-        # `bigint` scalars (int64/uint64) need a `BigInt(...)` / `Number(...)`
-        # conversion; `number`/`boolean` scalars pass through.
-        return _scalar_ts(t) != "bigint"
+    if isinstance(t, mi.IntType):
+        # `bigint` ints (int64/uint64/Int/UInt) need a `BigInt(...)` /
+        # `_toSafeInt(...)` conversion; `number` ints pass through.
+        return not _is_bigint(t)
     if isinstance(t, (mi.ListType, mi.VarTupleType)):
         return _is_identity(t.item_type)
     if isinstance(t, mi.TupleType):
@@ -494,8 +497,8 @@ class _CodecGenerator:
                     "codec() requires `tensor_encoder` to encode tensor types"
                 )
             return f"{self.tensor_encoder}({expr})"
-        if isinstance(t, mi.ScalarType):
-            # a `bigint` scalar. With force_int64 the msgpack lib encodes the
+        if _is_bigint(t):
+            # a `bigint` int. With force_int64 the msgpack lib encodes the
             # bigint directly (via useBigInt64); otherwise narrow to a number for
             # the wire, throwing if that would lose precision.
             if self.force_int64:
@@ -537,8 +540,8 @@ class _CodecGenerator:
                     "codec() requires `tensor_decoder` to decode tensor types"
                 )
             return f"{self.tensor_decoder}({expr} as TensorHandle)"
-        if isinstance(t, mi.ScalarType):
-            # a `bigint` scalar; the wire value is a number (or, with
+        if _is_bigint(t):
+            # a `bigint` int; the wire value is a number (or, with
             # useBigInt64, already a bigint), so normalize into a real bigint.
             return f"BigInt({expr} as number | bigint)"
         if isinstance(t, _CODEC_FUNC_TYPES):
@@ -829,12 +832,12 @@ function _toSafeInt(v: bigint | number): number {
 
 
 def _contains_bigint(t: mi.Type, _seen: set | None = None) -> bool:
-    """Whether a `bigint` scalar (int64/uint64) appears anywhere in the tree."""
+    """Whether a `bigint` int (int64/uint64/Int/UInt) appears anywhere in the tree."""
     if _seen is None:
         _seen = set()
     t = _unwrap(t)
-    if isinstance(t, mi.ScalarType):
-        return _scalar_ts(t) == "bigint"
+    if isinstance(t, mi.IntType):
+        return _is_bigint(t)
     if hasattr(t, "cls"):
         if t.cls in _seen:
             return False
@@ -867,12 +870,156 @@ def _str(s: str) -> str:
 def codec(
     type: Any,
     *,
+    msgpack: bool = True,
+    json: bool = True,
+    embed_msgpack: bool = True,
     tensor_encoder: str | None = None,
     tensor_decoder: str | None = None,
     force_int64: bool = False,
 ) -> str:
-    """Generate TypeScript type definitions plus MessagePack encoders/decoders
-    for a given type.
+    """Generate TypeScript type definitions plus a MessagePack/JSON codec.
+
+    By default (``embed_msgpack=True``) the output is a self-contained module
+    that inlines its own tight MessagePack reader/writer and exports a
+    ``msgpack`` and/or ``json`` namespace (``{ encode, decode }`` each) - the
+    TypeScript counterpart of `msgspec.javascript.codec`, and the client side of
+    a **type-directed** ``msgspec`` encoder. 64-bit / generic integer types
+    round-trip as native ``bigint`` (hex strings in JSON when large); ``bytes``
+    are base64 in JSON; ``Float32`` narrows to a 5-byte msgpack float32.
+
+    With ``embed_msgpack=False`` the older `@msgpack/msgpack`-based output is
+    produced instead (tensor support lives here; see the tensor params).
+
+    Parameters
+    ----------
+    type : type
+        The type to generate a codec for.
+    msgpack, json : bool, optional
+        Which format namespaces to emit (default both). Only used when
+        ``embed_msgpack=True``.
+    embed_msgpack : bool, optional
+        Inline our own msgpack runtime instead of importing ``@msgpack/msgpack``
+        (default ``True``).
+    tensor_encoder, tensor_decoder, force_int64
+        Only used when ``embed_msgpack=False`` (the ``@msgpack/msgpack`` path).
+
+    Returns
+    -------
+    str
+        The generated TypeScript source.
+    """
+    if not (msgpack or json):
+        raise ValueError("at least one of `msgpack` / `json` must be enabled")
+    if embed_msgpack:
+        return _codec_embed(type, msgpack, json)
+    return _codec_external(type, tensor_encoder, tensor_decoder, force_int64)
+
+
+def _codec_embed(type: Any, msgpack: bool, json: bool) -> str:
+    from . import _javascript as _js
+
+    type_infos = mi.multi_type_info([type], aliases=True)
+    (root,) = type_infos
+    component_types = _collect_component_types(type_infos)
+    name_map = _build_name_map(component_types)
+
+    if _contains_tensor(root):
+        raise NotImplementedError(
+            "the embedded TypeScript codec doesn't support tensor types yet - "
+            "pass embed_msgpack=False to use the @msgpack/msgpack path"
+        )
+
+    schema_gen = _SchemaGenerator(name_map, embed=True)
+    jsgen = _js._CodecGenerator(name_map)
+
+    parts = [_MSGPACK_RUNTIME_TS.strip()]
+
+    # Type definitions. The codec works with plain objects, so struct shapes are
+    # emitted as `interface` (not `class`) - accurate and `strict`-clean. Enums
+    # and union aliases are unaffected.
+    for cls, t in component_types.items():
+        parts.append(
+            schema_gen.to_def(name_map[cls], t).replace(
+                "export class ", "export interface ", 1
+            )
+        )
+    root_ref = schema_gen.to_ref(root)
+    if getattr(root, "cls", None) not in name_map:
+        parts.append(f"export type Root = {root_ref};")
+        root_ref = "Root"
+
+    def struct_components():
+        for cls, t in component_types.items():
+            if isinstance(t, _CODEC_FUNC_TYPES) and not isinstance(
+                t, mi.AbstractStructType
+            ):
+                yield name_map[cls], t
+
+    if msgpack:
+        for nm, t in struct_components():
+            parts.append(
+                _ts_sig_swap(
+                    jsgen.enc_def(nm, t),
+                    f"encode{nm}(w, v)",
+                    f"encode{nm}(w: Writer, v: {nm}): void",
+                )
+            )
+            dec = _ts_sig_swap(
+                jsgen.dec_def(nm, t),
+                f"decode{nm}(r)",
+                f"decode{nm}(r: Reader): {nm}",
+            )
+            # the decode accumulator is built untyped then returned as the struct
+            dec = dec.replace("const o = {", "const o: any = {")
+            parts.append(dec)
+        renc = jsgen.enc(root, "value")
+        parts.append(
+            "export const msgpack = {\n"
+            f"{_INDENT}encode(value: {root_ref}): Uint8Array {{\n"
+            f"{_INDENT}{_INDENT}const w = new Writer();\n"
+            f"{textwrap.indent(renc, _INDENT * 2)}\n"
+            f"{_INDENT}{_INDENT}return w.bytes();\n"
+            f"{_INDENT}}},\n"
+            f"{_INDENT}decode(bytes: Uint8Array): {root_ref} {{\n"
+            f"{_INDENT}{_INDENT}const r = new Reader(bytes);\n"
+            f"{_INDENT}{_INDENT}return {jsgen.dec(root)};\n"
+            f"{_INDENT}}},\n"
+            "};"
+        )
+
+    if json:
+        for nm, t in struct_components():
+            parts.append(
+                _ts_sig_swap(
+                    jsgen.json_enc_def(nm, t),
+                    f"encodeJson{nm}(v)",
+                    f"encodeJson{nm}(v: {nm}): any",
+                )
+            )
+            parts.append(
+                _ts_sig_swap(
+                    jsgen.json_dec_def(nm, t),
+                    f"decodeJson{nm}(o)",
+                    f"decodeJson{nm}(o: any): {nm}",
+                )
+            )
+        parts.append(
+            "export const json = {\n"
+            f"{_INDENT}encode(value: {root_ref}): string {{ return JSON.stringify({jsgen.json_enc(root, 'value')}); }},\n"
+            f"{_INDENT}decode(text: string): {root_ref} {{ const o = JSON.parse(text); return {jsgen.json_dec(root, 'o')}; }},\n"
+            "};"
+        )
+
+    return "\n\n".join(parts) + "\n"
+
+
+def _codec_external(
+    type: Any,
+    tensor_encoder: str | None = None,
+    tensor_decoder: str | None = None,
+    force_int64: bool = False,
+) -> str:
+    """The `@msgpack/msgpack`-based codec (``embed_msgpack=False``).
 
     The output imports ``encode``/``decode`` from ``@msgpack/msgpack`` and adds
     an ``encode(value)`` / ``decode(bytes)`` pair for the top-level type, along

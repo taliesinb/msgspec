@@ -9,6 +9,7 @@ except ImportError:  # pragma: no cover - Python < 3.12
 
 __all__ = [  # noqa: F822  (TensorHandle is provided via module __getattr__)
     'Int',
+    'UInt',
     'Float',
     'UInt8',
     'UInt16',
@@ -27,7 +28,8 @@ __all__ = [  # noqa: F822  (TensorHandle is provided via module __getattr__)
     'TensorHandle',
 ]
 
-Int = TypeAliasType("Int", int)      # treated as Int64 in arrays, and bigint in ordinary annotations
+Int = TypeAliasType("Int", int)      # generic signed integer: Int64 in arrays, bigint in ordinary annotations
+UInt = TypeAliasType("UInt", int)    # generic unsigned integer: UInt64 in arrays, bigint in ordinary annotations
 Float = TypeAliasType("Float", float)  # treated as Float64 in arrays, and number in ordinary annotations
 
 # `X = TypeAliasType("X", value)` is the back-compatible spelling of the PEP 695
@@ -45,7 +47,9 @@ Float32 = TypeAliasType("Float32", float)
 Float64 = TypeAliasType("Float64", float)
 Bool = TypeAliasType("Bool", bool)
 
-Scalar = TypeAliasType("Scalar", int | float | bool)
+# "Encode this scalar accurately": the marker union, so ints round-trip as
+# bigint, floats as number, bools as bool on the JS side.
+Scalar = TypeAliasType("Scalar", Int | Float | Bool)
 
 DType = TypeAliasType(
     "DType",
@@ -109,8 +113,11 @@ def parse_dtype(dtype: type | TypeAliasType | None) -> DType | None:
         name = dtype.__name__.lower()
         if name in DTYPE_STRINGS:
             return name
-        # `Int`/`Float` (and any other alias not itself a dtype) resolve via
-        # their underlying type: `Int` -> int64, `Float` -> float64.
+        # The generic markers: `Int` -> int64, `UInt` -> uint64, `Float` ->
+        # float64. `Int`/`Float` fall through to their `__value__` below;
+        # `UInt`'s value is plain `int`, so it needs an explicit mapping.
+        if name == 'uint':
+            return 'uint64'
         dtype = dtype.__value__
     if dtype is float:
         return 'float64'

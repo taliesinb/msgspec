@@ -1,9 +1,35 @@
 import os
 import platform
+import shutil
 import sys
+from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.build_py import build_py as _build_py
 from setuptools.extension import Extension
+
+# The `msgspec.javascript` bundle (the `@msgspec/msgpack` JS package) lives at
+# the repo top level. Copy it into the built package as `javascript_bundle/` so
+# it ships in the wheel and `msgspec.javascript.bundle_path()` can find it.
+_JS_BUNDLE_SRC = Path(__file__).parent / "javascript"
+_JS_BUNDLE_ITEMS = ("src", "package.json", "README.md")
+
+
+class build_py(_build_py):
+    def run(self):
+        super().run()
+        if not (_JS_BUNDLE_SRC / "src" / "msgpack.mjs").is_file():
+            return
+        dest = Path(self.build_lib) / "msgspec" / "javascript_bundle"
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in _JS_BUNDLE_ITEMS:
+            src = _JS_BUNDLE_SRC / item
+            if src.is_dir():
+                shutil.copytree(src, dest / item)
+            elif src.is_file():
+                shutil.copy2(src, dest / item)
 
 # Check for 32-bit windows builds, which currently aren't supported. We can't
 # rely on `platform.architecture` here since users can still run 32-bit python
@@ -68,4 +94,5 @@ ext_modules = [
 
 setup(
     ext_modules=ext_modules,
+    cmdclass={"build_py": build_py},
 )

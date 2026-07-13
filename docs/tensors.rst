@@ -28,29 +28,30 @@ constructor for annotating fields:
 
 The available dtype aliases are ``UInt8``, ``UInt16``, ``UInt32``, ``UInt64``,
 ``Int8``, ``Int16``, ``Int32``, ``Int64``, ``Float32``, ``Float64``, and
-``Bool``, plus the generic markers ``Int`` (an integer, dtype ``int64``) and
-``Float`` (dtype ``float64``). ``Tensor[shape, dtype]`` takes a shape (an
-``int`` number of axes, a tuple of sizes, or ``None``) and a dtype (one of the
-aliases, or ``None`` for any).
+``Bool``, plus the generic markers ``Int``/``UInt`` (a signed / unsigned
+integer, dtype ``int64``/``uint64``) and ``Float`` (dtype ``float64``).
+``Tensor[shape, dtype]`` takes a shape (an ``int`` number of axes, a tuple of
+sizes, or ``None``) and a dtype (one of the aliases, or ``None`` for any).
 
-``Int`` and ``Float`` are also useful as *ordinary* field annotations: unlike
-plain ``int``/``float`` (both ``number`` in TypeScript), ``Int`` maps to
-TypeScript ``bigint`` - preserving the integer/float distinction into JS. The
-:doc:`codec <typescript>` decodes these into real bigints (``BigInt(...)``). On
-encode, since `@msgpack/msgpack` can't serialize ``bigint`` directly, the codec
-narrows to a ``number`` but *throws* if the value exceeds the JS safe-integer
-range (``2**53``). Pass ``force_int64=True`` to ``codec`` to instead enable the
-msgpack library's ``useBigInt64`` mode and encode full 64-bit ints (larger,
-non-compact output).
+The integer/float markers double as *ordinary* field annotations that carry a
+precise wire format - see :ref:`type-directed-encoding` below. In short:
+``Int``/``UInt``/``Int64``/``UInt64`` become JavaScript ``bigint`` (round-tripped
+losslessly, as hex strings in JSON when large), and ``Float32`` narrows to a
+5-byte MessagePack float32. ``Scalar`` is the union ``Int | Float | Bool`` - a
+cheap way to say "encode this scalar accurately" (int → ``bigint``, float →
+``number``, bool → ``boolean`` on the JS side).
 
-These are ordinary :doc:`inspectable <inspect>` types. ``msgspec.inspect``
-reports them as ``ScalarType`` / ``TensorType`` nodes:
+These are ordinary :doc:`inspectable <inspect>` types. As *scalar* field types
+the integer/float markers carry their format inline on ``IntType``/``FloatType``
+(via ``itype``/``ftype``); inside a ``Tensor`` they set the tensor ``dtype``:
 
 .. code-block:: python
 
     >>> import msgspec
     >>> msgspec.inspect.type_info(Float32)
-    ScalarType(dtype='float32')
+    FloatType(gt=None, ge=None, lt=None, le=None, multiple_of=None, ftype='float32')
+    >>> msgspec.inspect.type_info(Int64)
+    IntType(gt=None, ge=None, lt=None, le=None, multiple_of=None, itype='int64')
     >>> msgspec.inspect.type_info(Tensor[3, Float32])
     TensorType(ndims=3, sizes=None, dtype='float32')
 
