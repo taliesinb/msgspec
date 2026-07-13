@@ -193,6 +193,7 @@ few:
     jsonschema.rst
     typescript.rst
     javascript.rst
+    rust.rst
     tensors.rst
     type-directed-encoding.rst
     schema-evolution.rst

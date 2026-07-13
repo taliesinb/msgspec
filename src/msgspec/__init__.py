@@ -24,5 +24,5 @@ def field(*, default=NODEFAULT, default_factory=NODEFAULT, name=None):
 field.__doc__ = _Field.__doc__
 
 
-from . import inspect, javascript, json, msgpack, structs, toml, typescript, yaml
+from . import inspect, javascript, json, msgpack, rust, structs, toml, typescript, yaml
 from ._version import __version__
