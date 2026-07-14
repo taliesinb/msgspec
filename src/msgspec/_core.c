@@ -548,6 +548,9 @@ typedef struct {
     PyObject *numpy_to_handle;  /* data._numpy_to_tensor_handle */
     PyObject *json_to_tensor;   /* data._json_object_to_tensor */
     PyObject *check_tensor;     /* data._check_tensor */
+    PyObject *ArrayMeta;        /* the metaclass of `Array` / `Array[...]` */
+    PyObject *ArrayHandle;      /* the `ArrayHandle` class (flat-array decode target) */
+    PyObject *array_to_handle;  /* data._array_to_tensor_handle */
     PyObject *numpy_ndarray;    /* numpy.ndarray, resolved lazily (NULL if numpy absent) */
     PyObject *str_numpy;        /* the string "numpy" */
     uint8_t gc_cycle;
@@ -3065,6 +3068,7 @@ typedef struct {
     PyObject *ndims;    /* int or None */
     PyObject *sizes;    /* tuple[int | None, ...] or None */
     PyObject *dtype;    /* str or None */
+    char is_array;      /* 1 if this is a flat `Array[...]` (else a `Tensor`) */
 } TensorInfo;
 
 struct StructInfo;
@@ -5273,11 +5277,13 @@ typenode_collect_type(TypeNodeCollectState *state, PyObject *obj) {
         state->tensor_obj = t;
     }
     else if (
-        state->mod->TensorMeta != NULL &&
-        Py_TYPE(t) == (PyTypeObject *)(state->mod->TensorMeta)
+        (state->mod->TensorMeta != NULL &&
+         Py_TYPE(t) == (PyTypeObject *)(state->mod->TensorMeta))
+        || (state->mod->ArrayMeta != NULL &&
+            Py_TYPE(t) == (PyTypeObject *)(state->mod->ArrayMeta))
     ) {
-        /* `Tensor` (== `Tensor[None, None]`, unconstrained) or a `Tensor[...]`
-         * specialization; the parsed spec is stored as a `TensorInfo`. */
+        /* `Tensor`/`Tensor[...]`, or a flat `Array`/`Array[...]` (a 1-d tensor);
+         * the parsed spec (incl. the array flag) is stored as a `TensorInfo`. */
         state->types |= MS_TYPE_TENSOR;
         state->tensor_obj = t;
     }
@@ -9427,6 +9433,7 @@ static PyMemberDef TensorInfo_members[] = {
     {"ndims", T_OBJECT_EX, offsetof(TensorInfo, ndims), READONLY, "The required rank, or None"},
     {"sizes", T_OBJECT_EX, offsetof(TensorInfo, sizes), READONLY, "The required per-axis sizes, or None"},
     {"dtype", T_OBJECT_EX, offsetof(TensorInfo, dtype), READONLY, "The required dtype, or None"},
+    {"is_array", T_BOOL, offsetof(TensorInfo, is_array), READONLY, "Whether this is a flat Array"},
     {NULL},
 };
 
@@ -9501,6 +9508,9 @@ TensorInfo_Convert(PyObject *cls)
     info->ndims = ndims;
     info->sizes = sizes;
     info->dtype = dtype;
+    /* A flat `Array[...]` has `ArrayMeta` as its metaclass. */
+    info->is_array = (mod->ArrayMeta != NULL
+                      && Py_TYPE(cls) == (PyTypeObject *)mod->ArrayMeta);
     PyObject_GC_Track(info);
 
     /* Best-effort cache on the class. Static types (e.g. TensorHandle) are
@@ -14036,7 +14046,7 @@ tensor_dtype_to_code(MsgspecState *mod, PyObject *dtype) {
 }
 
 static int
-mpack_encode_tensorhandle(EncoderState *self, PyObject *obj)
+mpack_encode_tensorhandle(EncoderState *self, PyObject *obj, int is_array)
 {
     TensorHandle *th = (TensorHandle *)obj;
     Py_buffer buffer;
@@ -14104,7 +14114,8 @@ mpack_encode_tensorhandle(EncoderState *self, PyObject *obj)
     }
     if (ms_write(self, header, header_len) < 0) goto done;
 
-    meta[0] = (char)MS_TENSOR_VERSION;
+    /* The high bit of the version byte flags a flat `Array` (vs a `Tensor`). */
+    meta[0] = (char)(MS_TENSOR_VERSION | (is_array ? 0x80 : 0));
     meta[1] = (char)(unsigned char)dtype_code;
     meta[2] = shape_is_none ? (char)0xFF : (char)ndim;
     if (ms_write(self, meta, 3) < 0) goto done;
@@ -14386,7 +14397,7 @@ mpack_encode_uncommon(EncoderState *self, PyTypeObject *type, PyObject *obj)
         return mpack_encode_ext(self, obj);
     }
     else if (type == &TensorHandle_Type) {
-        return mpack_encode_tensorhandle(self, obj);
+        return mpack_encode_tensorhandle(self, obj, 0);
     }
     else if (type == &Raw_Type) {
         return mpack_encode_raw(self, obj);
@@ -14423,7 +14434,7 @@ mpack_encode_uncommon(EncoderState *self, PyTypeObject *type, PyObject *obj)
     if (ndarray != NULL && PyObject_TypeCheck(obj, ndarray)) {
         PyObject *handle = PyObject_CallOneArg(self->mod->numpy_to_handle, obj);
         if (handle == NULL) return -1;
-        int status = mpack_encode_tensorhandle(self, handle);
+        int status = mpack_encode_tensorhandle(self, handle, 0);
         Py_DECREF(handle);
         return status;
     }
@@ -14696,6 +14707,20 @@ mpack_encode_typed(EncoderState *self, PyObject *obj, TypeNode *type) {
         TypeNode *ktype, *vtype;
         TypeNode_get_dict(type, &ktype, &vtype);
         return mpack_encode_dict_typed(self, obj, vtype);
+    }
+    if (t & MS_TYPE_TENSOR) {
+        /* A flat `Array[...]` accepts bytes/memoryview/ArrayHandle/numpy: coerce
+         * to a TensorHandle and write with the array flag set. Plain `Tensor`
+         * falls through to the value-directed path (numpy / TensorHandle). */
+        TensorInfo *info = (TensorInfo *)TypeNode_get_tensor(type);
+        if (info->is_array) {
+            PyObject *h = PyObject_CallFunctionObjArgs(
+                self->mod->array_to_handle, obj, (PyObject *)info, NULL);
+            if (h == NULL) return -1;
+            int status = mpack_encode_tensorhandle(self, h, 1);
+            Py_DECREF(h);
+            return status;
+        }
     }
     return mpack_encode(self, obj);
 }
@@ -15961,6 +15986,19 @@ json_encode_typed(EncoderState *self, PyObject *obj, TypeNode *type) {
         TypeNode *ktype, *vtype;
         TypeNode_get_dict(type, &ktype, &vtype);
         return json_encode_dict_typed(self, obj, vtype);
+    }
+    if (t & MS_TYPE_TENSOR) {
+        /* A flat `Array[...]`: coerce bytes/memoryview/ArrayHandle/numpy to a
+         * TensorHandle and emit the tensor JSON object (same as `Tensor`). */
+        TensorInfo *info = (TensorInfo *)TypeNode_get_tensor(type);
+        if (info->is_array) {
+            PyObject *h = PyObject_CallFunctionObjArgs(
+                self->mod->array_to_handle, obj, (PyObject *)info, NULL);
+            if (h == NULL) return -1;
+            int status = json_encode_tensorhandle(self, h);
+            Py_DECREF(h);
+            return status;
+        }
     }
     /* Everything else (str/bytes/float/fixtuple/enum/...) is byte-identical to
      * the value-directed path. */
@@ -17790,8 +17828,10 @@ mpack_decode_tensorhandle(
     if (size < 3) {
         return ms_error_with_path("Invalid tensor: truncated header%U", path);
     }
-    uint8_t version = (uint8_t)data_buf[0];
-    if (version != MS_TENSOR_VERSION) {
+    uint8_t vbyte = (uint8_t)data_buf[0];
+    /* The high bit flags a flat `Array` (vs a `Tensor`); low 7 bits are version. */
+    int is_array_wire = (vbyte & 0x80) != 0;
+    if ((vbyte & 0x7F) != MS_TENSOR_VERSION) {
         return ms_error_with_path("Invalid tensor: unsupported version%U", path);
     }
     uint8_t dcode = (uint8_t)data_buf[1];
@@ -17833,9 +17873,12 @@ mpack_decode_tensorhandle(
         goto done;
     }
 
-    /* Validate the decoded dtype/shape against the annotation (if any). */
+    /* Validate against the annotation, and decide the handle kind: a typed
+     * target follows its `is_array` flag; an `Any` target follows the wire. */
+    int want_array = is_array_wire;
     if (type->types & MS_TYPE_TENSOR) {
         PyObject *info = TypeNode_get_tensor(type);
+        want_array = ((TensorInfo *)info)->is_array;
         PyObject *r = PyObject_CallFunctionObjArgs(
             mod->check_tensor, info, dtype, shape, NULL
         );
@@ -17860,7 +17903,17 @@ mpack_decode_tensorhandle(
         /* native = memoryview(bytes(raw payload)) */
         native = PyMemoryView_FromObject(raw);
         if (native == NULL) goto done;
-        out = TensorHandle_New(native, dtype, shape);
+        if (want_array) {
+            /* ArrayHandle(memoryview, dtype, size) - size is the sole axis. */
+            PyObject *asize = (shape != Py_None && PyTuple_GET_SIZE(shape) > 0)
+                ? PyTuple_GET_ITEM(shape, 0) : Py_None;
+            out = PyObject_CallFunctionObjArgs(
+                mod->ArrayHandle, native, dtype, asize, NULL
+            );
+        }
+        else {
+            out = TensorHandle_New(native, dtype, shape);
+        }
     }
 
 done:
@@ -24159,6 +24212,9 @@ msgspec_clear(PyObject *m)
     Py_CLEAR(st->numpy_to_handle);
     Py_CLEAR(st->json_to_tensor);
     Py_CLEAR(st->check_tensor);
+    Py_CLEAR(st->ArrayMeta);
+    Py_CLEAR(st->ArrayHandle);
+    Py_CLEAR(st->array_to_handle);
     Py_CLEAR(st->numpy_ndarray);
     Py_CLEAR(st->str_numpy);
     return 0;
@@ -24244,6 +24300,9 @@ msgspec_traverse(PyObject *m, visitproc visit, void *arg)
     Py_VISIT(st->numpy_to_handle);
     Py_VISIT(st->json_to_tensor);
     Py_VISIT(st->check_tensor);
+    Py_VISIT(st->ArrayMeta);
+    Py_VISIT(st->ArrayHandle);
+    Py_VISIT(st->array_to_handle);
     Py_VISIT(st->numpy_ndarray);
     Py_VISIT(st->str_numpy);
     return 0;
@@ -24461,6 +24520,9 @@ PyInit__core(void)
     SET_REF(numpy_to_handle, "_numpy_to_tensor_handle");
     SET_REF(json_to_tensor, "_json_object_to_tensor");
     SET_REF(check_tensor, "_check_tensor");
+    SET_REF(ArrayMeta, "ArrayMeta");
+    SET_REF(ArrayHandle, "ArrayHandle");
+    SET_REF(array_to_handle, "_array_to_tensor_handle");
     Py_DECREF(temp_module);
 
     temp_module = PyImport_ImportModule("types");

@@ -163,7 +163,8 @@ directory; in an installed wheel, to the copy bundled inside the package.
     ``datetime``/``UUID``/``Decimal`` types are not yet supported and raise
     ``NotImplementedError``; ``omit_defaults`` structs are encoded with all
     fields present. :doc:`Tensors <tensors>` **are** supported - they decode to a
-    re-exported ``TensorHandle`` (typed array + ``dtype`` + ``shape``). The
+    re-exported ``TensorHandle`` (typed array + ``dtype`` + ``shape``), and flat
+    ``Array[...]`` types decode to a plain typed array. The
     inlined runtime is authored and tested at
     ``javascript/src/msgpack.mjs`` in the repository, and is also published as a
     standalone package for direct use.

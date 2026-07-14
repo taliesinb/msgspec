@@ -26,6 +26,8 @@ __all__ = [  # noqa: F822  (TensorHandle is provided via module __getattr__)
     'DType',
     'Tensor',
     'TensorHandle',
+    'Array',
+    'ArrayHandle',
 ]
 
 Int = TypeAliasType("Int", int)      # generic signed integer: Int64 in arrays, bigint in ordinary annotations
@@ -239,8 +241,8 @@ def _check_tensor(info, dtype, shape):
 
 def _json_object_to_tensor(obj, dec_tensor, info):
     # Convert a decoded JSON tensor object {"type", "shape", "dtype", "data"}
-    # into a TensorHandle (or, if `dec_tensor` is given, the caller's tensor),
-    # validating against `info` first. Called from the C JSON decoder.
+    # into a TensorHandle/ArrayHandle (or, if `dec_tensor` is given, the caller's
+    # tensor), validating against `info` first. Called from the C JSON decoder.
     import base64
 
     data = obj.get("data")
@@ -251,9 +253,154 @@ def _json_object_to_tensor(obj, dec_tensor, info):
     _check_tensor(info, dtype, shape)
     if dec_tensor is not None:
         return dec_tensor(shape, dtype, raw)
+    if info is not None and getattr(info, "is_array", False):
+        size = shape[0] if shape else (len(raw) // _dtype_itemsize(dtype) if dtype else None)
+        return ArrayHandle(memoryview(raw), dtype, size)
     from ._core import TensorHandle
 
     return TensorHandle(memoryview(raw), dtype, shape)
+
+
+# ----
+# `Array[dtype]` / `Array[dtype, size]` - a flat (1-dimensional) array. On the
+# wire it reuses the tensor MessagePack extension (code 84) with the array flag
+# set (see `_core.c`), and the tensor JSON object form. Unlike `Tensor`, the
+# type-directed encoder additionally accepts a `bytes`, a `memoryview` (whose
+# element size must match the dtype), or an `ArrayHandle`; and it decodes to an
+# `ArrayHandle` (a `memoryview` + dtype + size). In the JS/TS codecs it maps to
+# a plain typed array, with no handle wrapper.
+
+_DTYPE_ITEMSIZE = {
+    'uint8': 1, 'int8': 1, 'bool': 1,
+    'uint16': 2, 'int16': 2,
+    'uint32': 4, 'int32': 4, 'float32': 4,
+    'uint64': 8, 'int64': 8, 'float64': 8,
+}
+
+# struct/memoryview format char -> dtype (for inferring/validating a memoryview's
+# element type). Platform-width codes ('l'/'L'/'n'/'N') are intentionally omitted.
+_FORMAT_DTYPE = {
+    'B': 'uint8', 'b': 'int8', '?': 'bool', 'c': 'uint8',
+    'H': 'uint16', 'h': 'int16',
+    'I': 'uint32', 'i': 'int32', 'f': 'float32',
+    'Q': 'uint64', 'q': 'int64', 'd': 'float64',
+}
+
+
+def _dtype_itemsize(dtype):
+    return _DTYPE_ITEMSIZE.get(dtype, 1)
+
+
+class ArrayMeta(type):
+    # These class attributes are read by the C extension's `TensorInfo` (an
+    # `Array` is a 1-dimensional tensor); `size` is the array-specific alias for
+    # a single-axis `sizes`.
+    ndims = 1
+    sizes = None
+    dtype = None
+    size = None
+
+    def __getitem__(self, args):
+        if isinstance(args, tuple):
+            assert len(args) == 2, "Array[dtype] or Array[dtype, size]"
+            d_arg, s_arg = args
+        else:
+            d_arg, s_arg = args, None
+        dtype = parse_dtype(d_arg)
+        if s_arg is not None and not isinstance(s_arg, int):
+            raise TypeError("Array size must be an int or None")
+        key = ('array', dtype, s_arg)
+        if key in TYPE_CACHE:
+            return TYPE_CACHE[key]
+        arr_t = ArrayMeta.__new__(
+            ArrayMeta, 'Array', (Array,),
+            dict(dtype=dtype, size=s_arg, ndims=1,
+                 sizes=(s_arg,) if s_arg is not None else None),
+        )
+        TYPE_CACHE[key] = arr_t
+        return arr_t
+
+    def __repr__(cls):
+        if cls.size is not None:
+            return f'Array[{cls.dtype!r}, {cls.size}]'
+        return f'Array[{cls.dtype!r}]'
+
+
+class Array(metaclass=ArrayMeta):
+    ...
+
+
+class ArrayHandle:
+    """An opaque handle to a flat array: a `data` buffer (bytes/memoryview) plus
+    its element `dtype` and `size` (element count). Decoding an `Array[...]`
+    produces one; constructing one lets you encode a flat array."""
+
+    __slots__ = ('data', 'dtype', 'size')
+
+    def __init__(self, data, dtype=None, size=None):
+        self.data = data
+        self.dtype = dtype
+        self.size = size
+
+    def __repr__(self):
+        return f'ArrayHandle(dtype={self.dtype!r}, size={self.size!r})'
+
+
+def _array_to_tensor_handle(value, info):
+    # Coerce an `Array[...]`-typed value (bytes / memoryview / ArrayHandle /
+    # numpy) into a `TensorHandle` (native buffer + dtype + 1-tuple shape) that
+    # the C tensor encoder can write. Called from the C type-directed encoder;
+    # raises `TypeError` on a dtype/element-size mismatch.
+    from ._core import TensorHandle
+
+    want = info.dtype if info is not None else None
+
+    import sys
+    np = sys.modules.get('numpy')
+    if np is not None and isinstance(value, np.ndarray):
+        if value.ndim != 1:
+            raise TypeError(f"Array expects a 1-d value, got {value.ndim} dims")
+        h = _numpy_to_tensor_handle(value)
+        if want is not None and h.dtype != want:
+            raise TypeError(f"Expected Array of dtype {want!r}, got {h.dtype!r}")
+        return h
+
+    if isinstance(value, ArrayHandle):
+        buf = value.data
+        dtype = value.dtype or want
+        if want is not None and value.dtype is not None and value.dtype != want:
+            raise TypeError(f"Expected Array of dtype {want!r}, got {value.dtype!r}")
+        size = value.size
+    elif isinstance(value, memoryview):
+        got = _FORMAT_DTYPE.get(value.format)
+        dtype = want or got
+        if dtype is None:
+            raise TypeError("Cannot infer dtype for a memoryview Array; specify one")
+        if got is not None and want is not None and got != want:
+            raise TypeError(f"Expected Array of dtype {want!r}, got a {got!r} memoryview")
+        if value.itemsize != _dtype_itemsize(dtype):
+            raise TypeError(
+                f"memoryview element size {value.itemsize} doesn't match dtype {dtype!r}"
+            )
+        buf = value
+        size = value.nbytes // value.itemsize
+    elif isinstance(value, (bytes, bytearray)):
+        dtype = want or 'uint8'
+        isize = _dtype_itemsize(dtype)
+        if len(value) % isize:
+            raise TypeError(
+                f"bytes length {len(value)} isn't a multiple of dtype {dtype!r} size {isize}"
+            )
+        buf = value
+        size = len(value) // isize
+    else:
+        raise TypeError(
+            f"Can't encode {type(value).__name__!r} as an Array; expected bytes, "
+            "memoryview, ArrayHandle, or a 1-d numpy array"
+        )
+
+    native = buf if isinstance(buf, memoryview) else memoryview(buf)
+    return TensorHandle(native, dtype, (size,) if size is not None else None)
 
 
 def __getattr__(name):

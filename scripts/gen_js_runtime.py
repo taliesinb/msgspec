@@ -42,6 +42,15 @@ _TS_PARAMS = {
     "ext(code, u) {": "ext(code: number, u: Uint8Array) {",  # Writer.ext
     "ext() {": "ext(): [number, Uint8Array] {",  # Reader.ext (typed tuple return)
     "tensor(h) {": "tensor(h: TensorHandle) {",  # Writer.tensor (Reader.tensor has no arg)
+    "array(arr, dtype) {": "array(arr: any, dtype: string | null) {",  # Writer.array
+    "array(dtype) {": "array(dtype: string | null): any {",  # Reader.array
+    "function _arrDtype(arr) {": "function _arrDtype(arr: any) {",
+    "function encArrayJSON(arr, dtype) {": (
+        "function encArrayJSON(arr: any, dtype: string | null) {"
+    ),
+    "function decArrayJSON(o, dtype) {": (
+        "function decArrayJSON(o: any, dtype: string | null): any {"
+    ),
     "value(x) {": "value(x: any) {",  # Writer.value (Reader.value has no arg)
     "constructor(bytes) {": "constructor(bytes: Uint8Array) {",
     "constructor(array, dtype, shape) {": (
@@ -82,6 +91,7 @@ _TS_EXTRA = {
     "const o = {};": "const o: any = {};",
     "const _TDTYPE = {": "const _TDTYPE: any = {",
     "const _TCODE = [];": "const _TCODE: any[] = [];",
+    "const _ARRCTOR = new Map([": "const _ARRCTOR = new Map<any, string>([",
 }
 
 

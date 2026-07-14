@@ -519,3 +519,58 @@ def test_node_tensor_decode_from_node_buffer(tmp_path):
         "f64": True,
         "data": "1.5,2.5,3.5,4.5",
     }
+
+
+def test_array_codec_structure():
+    from msgspec.data import Array, Float32, UInt8
+
+    class Doc(Struct):
+        a: Array[UInt8]
+        b: Array[Float32]
+
+    src = msgspec.javascript.codec(Doc)
+    # flat Arrays use the plain typed-array runtime (no TensorHandle wrapper)
+    assert 'w.array(v["a"], "uint8")' in src
+    assert 'r.array("float32")' in src
+    assert "export { TensorHandle };" not in src  # no handle re-export for arrays
+
+
+@needs_node
+def test_node_array_roundtrip(tmp_path):
+    np = pytest.importorskip("numpy")
+    from msgspec.data import Array, Float32, Int64, UInt8
+
+    class Doc(Struct):
+        name: str
+        bytes8: Array[UInt8]
+        weights: Array[Float32]
+        ids: Array[Int64]
+
+    value = Doc(
+        name="x",
+        bytes8=np.array([0, 1, 2, 3], dtype=np.uint8),
+        weights=np.array([1.5, 2.5, -0.5], dtype=np.float32),
+        ids=np.array([1, -2, 2**62], dtype=np.int64),
+    )
+    ref_mp = msgspec.msgpack.encode(value, type=Doc).hex()
+    ref_json = msgspec.json.encode(value, type=Doc).decode()
+
+    driver = f"""
+    import {{ msgpack, json }} from "./codec.mjs";
+    const refMp = Uint8Array.from(Buffer.from({json.dumps(ref_mp)}, "hex"));
+    const dMp = msgpack.decode(refMp);
+    const dJson = json.decode({json.dumps(ref_json)});
+    console.log(JSON.stringify({{
+      mpHex: Buffer.from(msgpack.encode(dMp)).toString("hex"),
+      jsonOut: json.encode(dJson),
+      u8: dMp.bytes8 instanceof Uint8Array,
+      f32: dMp.weights instanceof Float32Array,
+      i64: dMp.ids instanceof BigInt64Array,
+      data: [...dMp.bytes8].join(","),
+      bigOk: dMp.ids[2] === (2n ** 62n),
+    }}));
+    """
+    out = json.loads(_run_node(msgspec.javascript.codec(Doc), driver, tmp_path))
+    assert out["mpHex"] == ref_mp and out["jsonOut"] == ref_json
+    assert out["u8"] and out["f32"] and out["i64"] and out["bigOk"]
+    assert out["data"] == "0,1,2,3"

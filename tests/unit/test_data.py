@@ -539,3 +539,92 @@ def test_decode_no_reference_leak():
     # extra referent and shouldn't be leaked elsewhere.
     assert isinstance(native, memoryview)
     assert bytes(native) == b"x" * 32
+
+
+# --- Array (flat 1-d array) -------------------------------------------------
+
+
+class TestArray:
+    def test_bytes_to_array_uint8(self):
+        from msgspec.data import Array, ArrayHandle, UInt8
+
+        for enc, dec in [
+            (msgspec.msgpack.encode, msgspec.msgpack.decode),
+            (msgspec.json.encode, msgspec.json.decode),
+        ]:
+            buf = enc(b"\x00\x01\x02\x03", type=Array[UInt8])
+            out = dec(buf, type=Array[UInt8])
+            assert isinstance(out, ArrayHandle)
+            assert bytes(out.data) == b"\x00\x01\x02\x03"
+            assert out.dtype == "uint8" and out.size == 4
+
+    def test_array_flag_distinguishes_from_tensor(self):
+        # msgpack: the array flag is the high bit of the ext version byte.
+        from msgspec.data import Array, UInt8
+
+        arr = msgspec.msgpack.encode(b"\x01\x02", type=Array[UInt8])
+        # ext8: c7 <len> 54 <version-byte> ...; version byte has 0x80 set
+        assert arr[3] == 0x81
+
+    def test_memoryview_float32(self):
+        from msgspec.data import Array, ArrayHandle, Float32
+
+        a = array.array("f", [1.5, 2.5, -0.5])
+        out = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(memoryview(a), type=Array[Float32]),
+            type=Array[Float32],
+        )
+        assert isinstance(out, ArrayHandle)
+        assert out.dtype == "float32" and out.size == 3
+        assert array.array("f", bytes(out.data)).tolist() == [1.5, 2.5, -0.5]
+
+    def test_arrayhandle_roundtrip(self):
+        from msgspec.data import Array, ArrayHandle, Int64
+
+        h = ArrayHandle(array.array("q", [1, -2, 2**62]).tobytes(), "int64", 3)
+        out = msgspec.json.decode(
+            msgspec.json.encode(h, type=Array[Int64]), type=Array[Int64]
+        )
+        assert array.array("q", bytes(out.data)).tolist() == [1, -2, 2**62]
+
+    def test_struct_field(self):
+        from msgspec.data import Array, ArrayHandle, Float32
+
+        class Doc(Struct):
+            name: str
+            vals: Array[Float32]
+
+        d = Doc(name="x", vals=memoryview(array.array("f", [1.0, 2.0])))
+        out = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(d, type=Doc), type=Doc
+        )
+        assert isinstance(out.vals, ArrayHandle)
+        assert array.array("f", bytes(out.vals.data)).tolist() == [1.0, 2.0]
+
+    def test_any_decode_follows_wire_flag(self):
+        from msgspec.data import Array, ArrayHandle, UInt8
+
+        arr = msgspec.msgpack.encode(b"\x01\x02", type=Array[UInt8])
+        assert isinstance(msgspec.msgpack.decode(arr), ArrayHandle)
+
+    def test_tensor_target_still_gives_tensorhandle(self):
+        # Decoding array-flagged bytes against a Tensor target follows the
+        # target (a TensorHandle), not the wire flag.
+        from msgspec.data import Array, Tensor, UInt8
+
+        arr = msgspec.msgpack.encode(b"\x01\x02", type=Array[UInt8])
+        out = msgspec.msgpack.decode(arr, type=Tensor[1, UInt8])
+        assert isinstance(out, TensorHandle)
+
+    def test_dtype_mismatch_errors(self):
+        from msgspec.data import Array, Float32
+
+        with pytest.raises(TypeError):
+            msgspec.json.encode(b"\x00\x01", type=Array[Float32])  # not a multiple of 4
+
+    def test_inspect(self):
+        from msgspec.data import Array, Float32
+        from msgspec.inspect import ArrayType, type_info
+
+        assert type_info(Array[Float32, 8]) == ArrayType(dtype="float32", size=8)
+        assert type_info(Array) == ArrayType(dtype=None, size=None)

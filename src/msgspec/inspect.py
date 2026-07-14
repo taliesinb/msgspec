@@ -37,6 +37,7 @@ from ._utils import (  # type: ignore
 )
 from .data import (
     DTYPE_ALIASES,
+    ArrayMeta as _ArrayMeta,
     Bool as _Bool,
     DType,
     Float,
@@ -114,6 +115,7 @@ __all__ = (
     "StructType",
     "AbstractStructType",
     "TensorType",
+    "ArrayType",
     "is_struct",
     "is_struct_type",
     "FrozenDictType",
@@ -713,6 +715,14 @@ class TensorType(Type):
     dtype: DType | None                   # None means 'any type for this tensor'
 
 
+class ArrayType(Type):
+    """A flat (1-dimensional) `msgspec.data.Array`. Decodes to an `ArrayHandle`
+    in Python and to a plain typed array in the JS/TS codecs."""
+
+    dtype: DType | None  # None means 'any element type'
+    size: int | None     # None means 'any length'
+
+
 def multi_type_info(
     types: Iterable[Any], *, aliases: bool = False
 ) -> tuple[Type, ...]:
@@ -936,6 +946,11 @@ class _Translator:
                 ndims=getattr(typ, "ndims", None),
                 sizes=getattr(typ, "sizes", None),
                 dtype=getattr(typ, "dtype", None),
+            )
+        if tt is _ArrayMeta:
+            return ArrayType(
+                dtype=getattr(typ, "dtype", None),
+                size=getattr(typ, "size", None),
             )
         if tt is _TypeAliasType:
             itype = _INT_FORMATS.get(typ)

@@ -174,5 +174,40 @@ Both the MessagePack ext form and the JSON object form are byte-identical to
 converting your type to/from a ``TensorHandle``).
 
 
+Flat arrays (``Array``)
+-----------------------
+
+``msgspec.data.Array`` is a simpler sibling of ``Tensor`` for **flat
+(1-dimensional)** data: ``Array[dtype]`` or ``Array[dtype, size]`` (e.g.
+``Array[Float32]``, ``Array[UInt8, 256]``). It shares the tensor wire format (the
+same MessagePack extension, with an array flag, and the same JSON object), but is
+treated more directly at both ends:
+
+- **Python** - the type-directed encoder (``encode(value, type=Array[...])``)
+  accepts a ``bytes`` (for a byte-width dtype), a ``memoryview`` (whose element
+  size must match the dtype), an :class:`~msgspec.data.ArrayHandle`, or a 1-d
+  numpy array. Decoding produces an ``ArrayHandle`` - a ``data`` buffer (a
+  ``memoryview``) plus its ``dtype`` and ``size``.
+
+  .. code-block:: python
+
+      import msgspec
+      from msgspec.data import Array, ArrayHandle, Float32
+
+      buf = msgspec.msgpack.encode(memoryview(my_floats), type=Array[Float32])
+      handle = msgspec.msgpack.decode(buf, type=Array[Float32])  # -> ArrayHandle
+
+- **JavaScript / TypeScript** - a flat ``Array`` maps to a plain `typed array`_
+  (``Uint8Array``, ``Float32Array``, ``BigInt64Array``, …) with **no handle
+  wrapper** and no hooks: it *is* the ``XxxArray``. Encoding takes one; decoding
+  returns one. Byte-identical to Python for both MessagePack and JSON.
+
+  .. code-block:: typescript
+
+      const doc = msgpack.decode(bytes);
+      doc.weights;   // Float32Array (a plain typed array)
+      msgpack.encode({ weights: new Float32Array([1, 2, 3]) });
+
+
 .. _numpy: https://numpy.org/
 .. _typed array: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Typed_arrays

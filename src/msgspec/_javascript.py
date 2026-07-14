@@ -76,6 +76,12 @@ def _js_bool(b: bool) -> str:
     return "true" if b else "false"
 
 
+def _arr_dtype(t: mi.ArrayType) -> str:
+    """The JS dtype argument for a flat `Array`: a quoted dtype string literal,
+    or ``null`` (infer from the typed array / wire) when the dtype is any."""
+    return _str(t.dtype) if t.dtype is not None else "null"
+
+
 def _json_identity(t: mi.Type) -> bool:
     """Whether a value of this type is already JSON-ready (no transform needed
     on encode, none on decode) - so it can pass straight through
@@ -211,6 +217,8 @@ class _CodecGenerator:
             return f"w.bin({v});"
         if isinstance(t, mi.TensorType):
             return f"w.tensor({self._tensor_in(v)});"
+        if isinstance(t, mi.ArrayType):
+            return f"w.array({v}, {_arr_dtype(t)});"
         if isinstance(t, (mi.AnyType, mi.RawType)):
             return f"w.value({v});"
         if isinstance(t, mi.EnumType):
@@ -377,6 +385,8 @@ class _CodecGenerator:
             return "r.bin()"
         if isinstance(t, mi.TensorType):
             return self._tensor_out("r.tensor()")
+        if isinstance(t, mi.ArrayType):
+            return f"r.array({_arr_dtype(t)})"
         if isinstance(t, (mi.AnyType, mi.RawType)):
             return "r.value()"
         if isinstance(t, mi.EnumType):
@@ -616,6 +626,8 @@ class _CodecGenerator:
             return f"b64encode({v})"
         if isinstance(t, mi.TensorType):
             return f"encTensorJSON({self._tensor_in(v)})"
+        if isinstance(t, mi.ArrayType):
+            return f"encArrayJSON({v}, {_arr_dtype(t)})"
         if isinstance(t, (mi.ListType, mi.VarTupleType)):
             return f"{v}.map((_e) => {self.json_enc(t.item_type, '_e')})"
         if isinstance(t, (mi.SetType, mi.FrozenSetType)):
@@ -650,6 +662,8 @@ class _CodecGenerator:
             return f"b64decode({o})"
         if isinstance(t, mi.TensorType):
             return self._tensor_out(f"decTensorJSON({o})")
+        if isinstance(t, mi.ArrayType):
+            return f"decArrayJSON({o}, {_arr_dtype(t)})"
         if isinstance(t, (mi.ListType, mi.VarTupleType)):
             return f"{o}.map((_e) => {self.json_dec(t.item_type, '_e')})"
         if isinstance(t, (mi.SetType, mi.FrozenSetType)):

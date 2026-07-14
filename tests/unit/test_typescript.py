@@ -785,3 +785,66 @@ class TestCodecEmbed:
         out = _json.loads(res.stdout.strip())
         assert out == {"mp": True, "json": True, "handle": True,
                        "meta": True, "data": True, "f32": True}
+
+    def _array_doc(self):
+        from msgspec.data import Array, Float32, UInt8
+
+        class Doc(Struct):
+            tag: str
+            bytes8: Array[UInt8]
+            weights: Array[Float32]
+
+        return Doc
+
+    def test_array_structure(self):
+        # a flat Array field is a plain typed array (no TensorHandle)
+        out = msgspec.typescript.codec(self._array_doc())
+        assert "  bytes8: Uint8Array;" in out
+        assert "  weights: Float32Array;" in out
+        assert "w.array(" in out and "r.array(" in out
+
+    @needs_tsc
+    def test_tsc_array_clean(self, tmp_path):
+        (tmp_path / "codec.ts").write_text(
+            msgspec.typescript.codec(self._array_doc())
+        )
+        res = subprocess.run(
+            [TSC, "--strict", "--noEmit", "--target", "es2020",
+             "--lib", "es2020,dom", str(tmp_path / "codec.ts")],
+            capture_output=True, text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+
+    @needs_node
+    def test_node_array_roundtrip(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        Doc = self._array_doc()
+        value = Doc(
+            tag="x",
+            bytes8=np.array([170, 187], dtype=np.uint8),
+            weights=np.array([3.5, 4.5], dtype=np.float32),
+        )
+        mp_hex = msgspec.msgpack.encode(value, type=Doc).hex()
+        js = msgspec.json.encode(value, type=Doc).decode()
+
+        (tmp_path / "codec.ts").write_text(msgspec.typescript.codec(Doc))
+        driver = f"""
+        import {{ msgpack, json }} from "./codec.ts";
+        const m: any = msgpack.decode(Uint8Array.from(Buffer.from({_json.dumps(mp_hex)}, "hex")));
+        const j: any = json.decode({_json.dumps(js)});
+        console.log(JSON.stringify({{
+          mp: Buffer.from(msgpack.encode(m)).toString("hex") === {_json.dumps(mp_hex)},
+          json: json.encode(j) === {_json.dumps(js)},
+          u8: m.bytes8 instanceof Uint8Array,
+          f32: m.weights instanceof Float32Array,
+          data: [...m.bytes8].join(",") === "170,187",
+        }}));
+        """
+        (tmp_path / "driver.ts").write_text(driver)
+        res = subprocess.run(
+            [NODE, "--experimental-strip-types", str(tmp_path / "driver.ts")],
+            capture_output=True, text=True,
+        )
+        assert res.returncode == 0, res.stderr
+        out = _json.loads(res.stdout.strip())
+        assert out == {"mp": True, "json": True, "u8": True, "f32": True, "data": True}

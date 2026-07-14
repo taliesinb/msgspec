@@ -305,6 +305,24 @@ class Writer {
     this.ext(84, body);
   }
 
+  // A flat `msgspec.data.Array`: a typed array written as a 1-d tensor ext with
+  // the array flag (high bit of the version byte). `dtype` may be null to infer
+  // it from the typed array's kind.
+  array(arr, dtype) {
+    const dt = dtype || _arrDtype(arr);
+    const spec = _TDTYPE[dt];
+    if (spec === undefined) throw new Error("msgpack: unknown array dtype " + dt);
+    const raw = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+    const body = new Uint8Array(11 + raw.length);
+    const dv = new DataView(body.buffer);
+    body[0] = 1 | 0x80;   // version | array flag
+    body[1] = spec[0];    // dtype code
+    body[2] = 1;          // ndims = 1
+    dv.setBigInt64(3, BigInt(arr.length), false);  // shape[0], big-endian
+    body.set(raw, 11);
+    this.ext(84, body);
+  }
+
   // Encode an arbitrary JS value (for `Any`-typed positions). Integers use the
   // smallest int form, bigints go through the 64-bit path, plain objects become
   // string-keyed maps.
@@ -491,6 +509,18 @@ class Reader {
     return new TensorHandle(array, spec[0], shape);
   }
 
+  // A flat `msgspec.data.Array` ext -> a typed array (no handle). `dtype` may be
+  // null to read it from the wire. Bytes are copied into an aligned buffer.
+  array(dtype) {
+    const data = this.ext()[1];
+    const off = 3 + 8 * data[2];
+    const Ctor = _TDTYPE[dtype || _TCODE[data[1]][0]][1];
+    const nbytes = data.byteLength - off;
+    const buf = new ArrayBuffer(nbytes);
+    new Uint8Array(buf).set(new Uint8Array(data.buffer, data.byteOffset + off, nbytes));
+    return new Ctor(buf, 0, nbytes / Ctor.BYTES_PER_ELEMENT);
+  }
+
   // Skip exactly one value (used for unknown struct fields).
   skip() {
     const t = this.b[this.p++];
@@ -631,6 +661,35 @@ class TensorHandle {
 function _tbytes(h) {
   const a = h.array;
   return new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+}
+
+// TypedArray constructor -> dtype name, to infer a flat Array's dtype from its
+// value when the type doesn't pin one down (a bare `Array`).
+const _ARRCTOR = new Map([
+  [Uint8Array, "uint8"], [Int8Array, "int8"],
+  [Uint16Array, "uint16"], [Int16Array, "int16"],
+  [Uint32Array, "uint32"], [Int32Array, "int32"],
+  [BigUint64Array, "uint64"], [BigInt64Array, "int64"],
+  [Float32Array, "float32"], [Float64Array, "float64"],
+]);
+function _arrDtype(arr) {
+  const dt = _ARRCTOR.get(arr.constructor);
+  if (dt === undefined) throw new Error("msgpack: unsupported typed array for Array");
+  return dt;
+}
+
+// A flat `msgspec.data.Array` -> its JSON object form (same shape as a tensor's).
+function encArrayJSON(arr, dtype) {
+  const dt = dtype || _arrDtype(arr);
+  const raw = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  return { type: "tensor", shape: [arr.length], dtype: dt, data: b64encode(raw) };
+}
+
+// The inverse: a parsed JSON tensor object -> a typed array (no handle).
+function decArrayJSON(o, dtype) {
+  const Ctor = _TDTYPE[dtype || o.dtype][1];
+  const raw = b64decode(o.data);
+  return new Ctor(raw.buffer, raw.byteOffset, raw.byteLength / Ctor.BYTES_PER_ELEMENT);
 }
 
 // A TensorHandle -> its JSON object form (data base64-encoded), byte-compatible

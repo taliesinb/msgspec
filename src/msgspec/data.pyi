@@ -19,6 +19,8 @@ __all__ = [
     'DType',
     'Tensor',
     'TensorHandle',
+    'Array',
+    'ArrayHandle',
 ]
 
 # The runtime builds these as distinct `TypeAliasType` objects (so msgspec can
@@ -108,4 +110,33 @@ class TensorHandle:
         native: Any,
         dtype: str | None = None,
         shape: tuple[int, ...] | None = None,
+    ) -> None: ...
+
+# ----
+
+class ArrayMeta(type):
+    size: int | None
+    dtype: DType | None
+    # `Tensor[rank, dtype]` - a rank (or None for any rank)
+    @overload
+    def __getitem__(cls, args: _Dtype) -> type[Array]: ...
+    # `Tensor[(size, ...), dtype]` - explicit per-axis sizes (each may be None)
+    @overload
+    def __getitem__(cls, args: tuple[_Dtype, int | None]) -> type[Array]: ...
+
+class Array(metaclass=ArrayMeta):
+    @overload
+    def __class_getitem__(cls, args: _Dtype) -> type[Array]: ...
+    @overload
+    def __class_getitem__(cls, args: tuple[_Dtype, int | None]) -> type[Array]: ...
+
+class ArrayHandle:
+    data: bytes | memoryview
+    dtype: str | None
+    size: int | None
+    def __init__(
+        self,
+        data: bytes | memoryview,
+        dtype: str | None = None,
+        size: int | None = None,
     ) -> None: ...

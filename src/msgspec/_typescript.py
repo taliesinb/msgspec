@@ -326,6 +326,12 @@ class _SchemaGenerator:
             if t.dtype is None:
                 return "ArrayBufferView"
             return _DTYPE_TS_TENSOR[t.dtype]
+        elif isinstance(t, mi.ArrayType):
+            # A flat `Array` is a plain typed array (no handle) in both the bare
+            # schema and the embedded codec, dispatched on dtype.
+            if t.dtype is None:
+                return "ArrayBufferView"
+            return _DTYPE_TS_TENSOR[t.dtype]
         elif isinstance(t, mi.UnionType):
             return " | ".join(self.to_ref(a) for a in t.types)
         elif isinstance(t, mi.LiteralType):
