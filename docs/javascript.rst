@@ -100,6 +100,11 @@ when **encoding** and are dispatched on it when **decoding**. An
 descendants. The decoder writes the tag field back onto the returned object so a
 value can be decoded and re-encoded unchanged.
 
+Pass ``elide_implied_tag=True`` to omit the tag wherever the schema position is
+a single concrete struct (keeping it in union positions) - matching a Python
+encoder constructed with the same option (see
+:doc:`type-directed-encoding`).
+
 .. code-block:: python
 
     from typing import Union

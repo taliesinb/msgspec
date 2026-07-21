@@ -848,3 +848,36 @@ class TestCodecEmbed:
         assert res.returncode == 0, res.stderr
         out = _json.loads(res.stdout.strip())
         assert out == {"mp": True, "json": True, "u8": True, "f32": True, "data": True}
+
+
+class TestCodecEmbedElideImpliedTag:
+    def _doc(self):
+        class Cat(Struct, tag="cat"):
+            name: str
+
+        class Dog(Struct, tag="dog"):
+            legs: int
+
+        class Doc(Struct):
+            mono: Cat
+            poly: Union[Cat, Dog]
+
+        return Doc
+
+    def test_structure(self):
+        out = msgspec.typescript.codec(self._doc(), elide_implied_tag=True)
+        assert "export function encodeCat(w: Writer, v: Cat, tagged: boolean): void" in out
+        assert "w.mapHeader(tagged ? 2 : 1);" in out
+        assert 'encodeCat(w, v["mono"], false);' in out
+        assert "export function encodeJsonCat(v: Cat, tagged: boolean): any" in out
+        assert "const o: any = tagged ?" in out
+
+    def test_off_by_default(self):
+        out = msgspec.typescript.codec(self._doc())
+        assert "tagged" not in out
+
+    def test_requires_embed(self):
+        with pytest.raises(ValueError, match="embed_msgpack"):
+            msgspec.typescript.codec(
+                self._doc(), embed_msgpack=False, elide_implied_tag=True
+            )

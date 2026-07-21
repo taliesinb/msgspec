@@ -574,3 +574,86 @@ def test_node_array_roundtrip(tmp_path):
     assert out["mpHex"] == ref_mp and out["jsonOut"] == ref_json
     assert out["u8"] and out["f32"] and out["i64"] and out["bigOk"]
     assert out["data"] == "0,1,2,3"
+
+
+# --- elide_implied_tag ------------------------------------------------------
+
+
+def test_codec_elide_implied_tag_structure():
+    class Cat(Struct, tag="cat"):
+        name: str
+
+    class Dog(Struct, tag="dog"):
+        legs: int
+
+    class Doc(Struct):
+        mono: Cat
+        poly: Union[Cat, Dog]
+
+    out = msgspec.javascript.codec(Doc, elide_implied_tag=True)
+    # tagged struct encoders take a `tagged` param and write the tag
+    # conditionally
+    assert "export function encodeCat(w, v, tagged)" in out
+    assert "w.mapHeader(tagged ? 2 : 1);" in out
+    # monomorphic position passes false, union dispatch passes true
+    assert 'encodeCat(w, v["mono"], false);' in out
+    assert 'case "cat": encodeCat(w, _u, true); break;' in out or (
+        'encodeCat(w, v["poly"], true); break;' in out
+    )
+    # json namespace mirrors it
+    assert "export function encodeJsonCat(v, tagged)" in out
+    # decode is unchanged: still seeds the tag on the object
+    assert 'const o = { type: "cat" };' in out
+
+
+def test_codec_elide_implied_tag_off_by_default():
+    class Cat(Struct, tag="cat"):
+        name: str
+
+    out = msgspec.javascript.codec(Cat)
+    assert "export function encodeCat(w, v)" in out
+    assert "tagged" not in out
+
+
+@needs_node
+def test_node_elide_implied_tag_byte_compat(tmp_path):
+    class Cat(Struct, tag="cat"):
+        name: str
+
+    class Dog(Struct, tag="dog"):
+        legs: int
+
+    class Doc(Struct):
+        mono: Cat
+        poly: Union[Cat, Dog]
+
+    value = Doc(mono=Cat(name="Reo"), poly=Dog(legs=4))
+    expected = msgspec.msgpack.encode(value, type=Doc, elide_implied_tag=True)
+    assert b"mono" in expected and expected.count(b"cat") == 0
+
+    expected_json = msgspec.json.encode(value, type=Doc, elide_implied_tag=True)
+
+    js_obj = {
+        "mono": {"type": "cat", "name": "Reo"},
+        "poly": {"type": "dog", "legs": 4},
+    }
+    driver = f"""
+    import {{ msgpack, json }} from "./codec.mjs";
+    const obj = {json.dumps(js_obj)};
+    const bytes = msgpack.encode(obj);
+    const hex = Buffer.from(bytes).toString("hex");
+    const back = msgpack.decode(bytes);
+    const roundtrips = JSON.stringify(back) === JSON.stringify(obj);
+    const text = json.encode(obj);
+    const jback = json.decode(text);
+    const jroundtrips = JSON.stringify(jback) === JSON.stringify(obj);
+    console.log(JSON.stringify({{ hex, roundtrips, text, jroundtrips }}));
+    """
+    codec_src = msgspec.javascript.codec(Doc, elide_implied_tag=True)
+    out = json.loads(_run_node(codec_src, driver, tmp_path))
+    assert out["hex"] == expected.hex()
+    assert out["roundtrips"] is True
+    assert out["text"] == expected_json.decode()
+    assert out["jroundtrips"] is True
+    # and Python can decode the JS bytes
+    assert msgspec.msgpack.decode(bytes.fromhex(out["hex"]), type=Doc) == value

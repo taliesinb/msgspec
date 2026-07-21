@@ -42,6 +42,7 @@ class Encoder:
         uuid_format: Literal["canonical", "hex"] = "canonical",
         order: Literal["deterministic", "sorted"] | None = None,
         type: Any = None,
+        elide_implied_tag: bool = False,
     ): ...
     def encode(self, obj: Any, /) -> bytes: ...
     def encode_lines(self, items: Iterable[Any], /) -> bytes: ...
@@ -108,6 +109,7 @@ def encode(
     enc_hook: _EncHookSig = None,
     order: Literal["deterministic", "sorted"] | None = None,
     type: Any = None,
+    elide_implied_tag: bool = False,
 ) -> bytes: ...
 def schema(
     type: Any,

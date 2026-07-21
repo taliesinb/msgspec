@@ -183,3 +183,77 @@ def test_encoder_type_matches_module_level():
     )
     # A plain Encoder is value-directed.
     assert msgspec.json.Encoder().encode(r) == msgspec.json.encode(r)
+
+
+# --- elide_implied_tag ------------------------------------------------------
+
+
+class _Animal(Struct, tag_field="kind", abstract=True):
+    pass
+
+
+class _Cat(_Animal):
+    name: str = "felix"
+
+
+class _Dog(_Animal):
+    legs: int = 4
+
+
+class _TaggedArr(Struct, tag="ta", array_like=True):
+    x: int = 1
+
+
+class TestElideImpliedTag:
+    def test_default_keeps_tag(self):
+        for encode in (msgspec.json.encode, msgspec.msgpack.encode):
+            data = encode(_Cat(), type=_Cat)
+            assert b"kind" in data
+
+    def test_monomorphic_target_elides(self):
+        assert (
+            msgspec.json.encode(_Cat(), type=_Cat, elide_implied_tag=True)
+            == b'{"name":"felix"}'
+        )
+        assert (
+            msgspec.msgpack.encode(_Cat(), type=_Cat, elide_implied_tag=True)
+            == msgspec.msgpack.encode({"name": "felix"})
+        )
+
+    def test_union_target_keeps_tag(self):
+        for encode in (msgspec.json.encode, msgspec.msgpack.encode):
+            data = encode([_Cat()], type=list[_Animal], elide_implied_tag=True)
+            assert b"kind" in data
+
+    def test_nested_fields_elide_by_position(self):
+        class Wrap(Struct):
+            mono: _Cat
+            poly: _Animal
+
+        data = msgspec.json.encode(
+            Wrap(mono=_Cat(), poly=_Dog()), type=Wrap, elide_implied_tag=True
+        )
+        assert data == b'{"mono":{"name":"felix"},"poly":{"kind":"_Dog","legs":4}}'
+
+    def test_array_like_never_elides(self):
+        for encode in (msgspec.json.encode, msgspec.msgpack.encode):
+            data = encode(_TaggedArr(), type=_TaggedArr, elide_implied_tag=True)
+            assert data == encode(_TaggedArr(), type=_TaggedArr)
+
+    def test_roundtrip(self):
+        v = [_Cat(name="tom"), _Cat()]
+        for mod in (msgspec.json, msgspec.msgpack):
+            data = mod.encode(v, type=list[_Cat], elide_implied_tag=True)
+            assert mod.decode(data, type=list[_Cat]) == v
+
+    def test_encoder_kwarg(self):
+        enc = msgspec.json.Encoder(type=_Cat, elide_implied_tag=True)
+        assert enc.encode(_Cat()) == b'{"name":"felix"}'
+        enc = msgspec.msgpack.Encoder(type=_Cat, elide_implied_tag=True)
+        assert enc.encode(_Cat()) == msgspec.msgpack.encode({"name": "felix"})
+
+    def test_no_effect_without_type(self):
+        assert (
+            msgspec.json.encode(_Cat(), elide_implied_tag=True)
+            == msgspec.json.encode(_Cat())
+        )

@@ -179,11 +179,25 @@ class _CodecGenerator:
         name_map: dict[Any, str],
         tensor_encoder: str | None = None,
         tensor_decoder: str | None = None,
+        elide_implied_tag: bool = False,
     ):
         self.name_map = name_map
         self.tensor_encoder = tensor_encoder
         self.tensor_decoder = tensor_decoder
+        self.elide_implied_tag = elide_implied_tag
         self._counter = 0
+
+    def _elidable(self, t: mi.Type) -> bool:
+        """Whether this struct's encode function takes a trailing ``tagged``
+        parameter: with ``elide_implied_tag``, a tagged (non-positional) struct
+        writes its tag only when called from a union dispatch, matching
+        ``msgspec``'s `elide_implied_tag=True` typed encoder."""
+        return (
+            self.elide_implied_tag
+            and isinstance(t, mi.StructType)
+            and t.tag_field is not None
+            and not t.array_like
+        )
 
     def _tensor_in(self, v: str) -> str:
         """The value to pack: the user value adapted to a `TensorHandle` if a
@@ -259,6 +273,8 @@ class _CodecGenerator:
                 "}"
             )
         if isinstance(t, _FUNC_TYPES):
+            if self._elidable(t):
+                return f"encode{self.name_map[t.cls]}(w, {v}, false);"
             return f"encode{self.name_map[t.cls]}(w, {v});"
         if isinstance(t, mi.UnionType):
             return self._enc_union(t, v)
@@ -288,7 +304,8 @@ class _CodecGenerator:
             return self._enc_scalar_union(v, has_none, others)
         tag_field = tagged[0].tag_field
         cases = "\n".join(
-            f"{_INDENT}case {_literal_value(m.tag)}: encode{self.name_map[m.cls]}(w, {v}); break;"
+            f"{_INDENT}case {_literal_value(m.tag)}: "
+            f"encode{self.name_map[m.cls]}(w, {v}{', true' if self._elidable(m) else ''}); break;"
             for m in tagged
         )
         switch = (
@@ -550,15 +567,24 @@ class _CodecGenerator:
         return isinstance(t, mi.StructType) and t.tag_field is not None
 
     def _enc_object_def(self, name: str, t: mi.Type) -> str:
-        n = len(t.fields) + (1 if self._tagged(t) else 0)
-        lines = [f"w.mapHeader({n});"]
-        if self._tagged(t):
-            lines.append(self._tag_write(t))
+        nf = len(t.fields)
+        if self._elidable(t):
+            lines = [
+                f"w.mapHeader(tagged ? {nf + 1} : {nf});",
+                f"if (tagged) {{\n{_ind(self._tag_write(t))}\n}}",
+            ]
+            sig = f"encode{name}(w, v, tagged)"
+        else:
+            n = nf + (1 if self._tagged(t) else 0)
+            lines = [f"w.mapHeader({n});"]
+            if self._tagged(t):
+                lines.append(self._tag_write(t))
+            sig = f"encode{name}(w, v)"
         for f in t.fields:
             lines.append(f"w.str({_str(f.encode_name)});")
             lines.append(self.enc(f.type, f"v[{_str(f.encode_name)}]"))
         body = "\n".join(lines)
-        return f"export function encode{name}(w, v) {{\n{_ind(body)}\n}}"
+        return f"export function {sig} {{\n{_ind(body)}\n}}"
 
     def _enc_array_def(self, name: str, t: mi.Type) -> str:
         n = len(t.fields) + (1 if self._tagged(t) else 0)
@@ -644,6 +670,8 @@ class _CodecGenerator:
                 self.json_enc(it, f"{v}[{i}]") for i, it in enumerate(t.item_types)
             ) + "]"
         if isinstance(t, _FUNC_TYPES):
+            if self._elidable(t):
+                return f"encodeJson{self.name_map[t.cls]}({v}, false)"
             return f"encodeJson{self.name_map[t.cls]}({v})"
         if isinstance(t, mi.UnionType):
             return self._json_union(t, v, encode=True)
@@ -699,7 +727,8 @@ class _CodecGenerator:
             verb = "encodeJson" if encode else "decodeJson"
             tag_field = tagged[0].tag_field
             cases = "\n".join(
-                f"{_INDENT}case {_literal_value(m.tag)}: return {verb}{self.name_map[m.cls]}(_u);"
+                f"{_INDENT}case {_literal_value(m.tag)}: return {verb}{self.name_map[m.cls]}"
+                f"(_u{', true' if encode and self._elidable(m) else ''});"
                 for m in tagged
             )
             iife = (
@@ -756,12 +785,25 @@ class _CodecGenerator:
 
     def _json_enc_object_def(self, name: str, t: mi.Type) -> str:
         lines = []
-        if self._tagged(t):
+        if self._tagged(t) and not self._elidable(t):
             lines.append(f"{_prop_name(t.tag_field)}: {_literal_value(t.tag)},")
         for f in t.fields:
             lines.append(
                 f"{_prop_name(f.encode_name)}: {self.json_enc(f.type, f'v[{_str(f.encode_name)}]')},"
             )
+        if self._elidable(t):
+            # the tag (first, matching msgspec's field order) only when the
+            # call site is a union dispatch
+            seed = (
+                f"const o = tagged ? {{ {_prop_name(t.tag_field)}: "
+                f"{_literal_value(t.tag)} }} : {{}};"
+            )
+            assigns = "\n".join(
+                f"o[{_str(f.encode_name)}] = {self.json_enc(f.type, f'v[{_str(f.encode_name)}]')};"
+                for f in t.fields
+            )
+            body = f"{seed}\n{assigns}\nreturn o;"
+            return f"export function encodeJson{name}(v, tagged) {{\n{_ind(body)}\n}}"
         body = "return {\n" + _ind("\n".join(lines)) + "\n};"
         return f"export function encodeJson{name}(v) {{\n{_ind(body)}\n}}"
 
@@ -805,6 +847,7 @@ def codec(
     json: bool = True,
     tensor_encoder: str | None = None,
     tensor_decoder: str | None = None,
+    elide_implied_tag: bool = False,
 ) -> str:
     """Generate a self-contained JavaScript codec for ``type``.
 
@@ -840,6 +883,11 @@ def codec(
         ``tensor_encoder(value)`` must return a ``TensorHandle`` on encode, and
         ``tensor_decoder(handle)`` receives a decoded ``TensorHandle`` on decode.
         When omitted, ``TensorHandle`` is used directly.
+    elide_implied_tag : bool, optional
+        Omit a tagged struct's tag wherever the schema position is that
+        concrete struct (rather than a union), matching a Python encoder
+        constructed with ``elide_implied_tag=True``. Union positions still
+        emit and dispatch on the tag. Defaults to ``False``.
 
     Returns
     -------
@@ -852,7 +900,9 @@ def codec(
     (root,) = mi.multi_type_info([type])
     component_types = _collect_component_types([root])
     name_map = _build_name_map(component_types)
-    gen = _CodecGenerator(name_map, tensor_encoder, tensor_decoder)
+    gen = _CodecGenerator(
+        name_map, tensor_encoder, tensor_decoder, elide_implied_tag
+    )
 
     parts = [_MSGPACK_RUNTIME.strip()]
     if _contains_tensor(root):

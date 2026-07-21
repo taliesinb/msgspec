@@ -497,6 +497,7 @@ typedef struct {
     PyObject *str_dec_tensor;
     PyObject *str_strict;
     PyObject *str_order;
+    PyObject *str_elide_implied_tag;
     PyObject *str_utcoffset;
     PyObject *str___origin__;
     PyObject *str___args__;
@@ -10203,6 +10204,8 @@ typedef struct EncoderState {
     enum order_mode order;
     char* (*resize_buffer)(PyObject**, Py_ssize_t);  /* callback for resizing buffer */
     bool in_decimal_callable;
+    bool elide_implied_tag;     /* typed encode: skip the tag when the target
+                                 * type implies the struct's identity */
 
     char *output_buffer_raw;    /* raw pointer to output_buffer internal buffer */
     Py_ssize_t output_len;      /* Length of output_buffer */
@@ -10219,6 +10222,7 @@ typedef struct Encoder {
     enum uuid_format uuid_format;
     enum order_mode order;
     TypeNode *type;  /* from `type=` (type-directed encoding), or NULL */
+    bool elide_implied_tag;
 } Encoder;
 
 static PyTypeObject Encoder_Type;
@@ -10273,17 +10277,27 @@ ms_write(EncoderState *self, const char *s, Py_ssize_t n)
 static int
 Encoder_init(Encoder *self, PyObject *args, PyObject *kwds)
 {
-    char *kwlist[] = {"enc_hook", "decimal_format", "uuid_format", "order", "type", NULL};
+    char *kwlist[] = {"enc_hook", "decimal_format", "uuid_format", "order", "type", "elide_implied_tag", NULL};
     PyObject *enc_hook = NULL, *decimal_format = NULL, *uuid_format = NULL, *order = NULL;
-    PyObject *type = NULL;
+    PyObject *type = NULL, *elide_implied_tag = NULL;
 
     if (
         !PyArg_ParseTupleAndKeywords(
-            args, kwds, "|$OOOOO", kwlist,
-            &enc_hook, &decimal_format, &uuid_format, &order, &type
+            args, kwds, "|$OOOOOO", kwlist,
+            &enc_hook, &decimal_format, &uuid_format, &order, &type,
+            &elide_implied_tag
         )
     ) {
         return -1;
+    }
+
+    if (elide_implied_tag == NULL) {
+        self->elide_implied_tag = false;
+    }
+    else {
+        int flag = PyObject_IsTrue(elide_implied_tag);
+        if (flag < 0) return -1;
+        self->elide_implied_tag = flag;
     }
 
     /* Process type-directed encoding target */
@@ -10529,6 +10543,7 @@ encoder_encode_common(
         .in_decimal_callable = false,
         .uuid_format = self->uuid_format,
         .order = self->order,
+        .elide_implied_tag = self->elide_implied_tag,
         .output_len = 0,
         .max_output_len = ENC_INIT_BUFSIZE,
         .resize_buffer = &ms_resize_bytes
@@ -10559,6 +10574,7 @@ encode_common(
 )
 {
     PyObject *enc_hook = NULL, *order = NULL, *type = NULL;
+    PyObject *elide_implied_tag = NULL;
     MsgspecState *mod = msgspec_get_state(module);
 
     /* Parse arguments */
@@ -10568,6 +10584,7 @@ encode_common(
         if ((enc_hook = find_keyword(kwnames, args + nargs, mod->str_enc_hook)) != NULL) nkwargs--;
         if ((order = find_keyword(kwnames, args + nargs, mod->str_order)) != NULL) nkwargs--;
         if ((type = find_keyword(kwnames, args + nargs, mod->str_type)) != NULL) nkwargs--;
+        if ((elide_implied_tag = find_keyword(kwnames, args + nargs, mod->str_elide_implied_tag)) != NULL) nkwargs--;
         if (nkwargs > 0) {
             PyErr_SetString(
                 PyExc_TypeError,
@@ -10599,6 +10616,12 @@ encode_common(
 
     state.order = parse_order_arg(order);
     if (state.order == ORDER_INVALID) return NULL;
+
+    if (elide_implied_tag != NULL) {
+        int flag = PyObject_IsTrue(elide_implied_tag);
+        if (flag < 0) return NULL;
+        state.elide_implied_tag = flag;
+    }
 
     state.output_buffer = PyBytes_FromStringAndSize(NULL, state.max_output_len);
     if (state.output_buffer == NULL) return NULL;
@@ -13218,7 +13241,7 @@ maybe_parse_number(
  *************************************************************************/
 
 PyDoc_STRVAR(Encoder__doc__,
-"Encoder(*, enc_hook=None, decimal_format='string', uuid_format='canonical', order=None)\n"
+"Encoder(*, enc_hook=None, decimal_format='string', uuid_format='canonical', order=None, type=None, elide_implied_tag=False)\n"
 "--\n"
 "\n"
 "A MessagePack encoder.\n"
@@ -13254,7 +13277,13 @@ PyDoc_STRVAR(Encoder__doc__,
 "      encoded binary output is necessary.\n"
 "    - `'sorted'`: Like `'deterministic'`, but *all* object-like types (structs,\n"
 "      dataclasses, ...) are also sorted by field name before encoding. This is\n"
-"      slower than `'deterministic'`, but may produce more human-readable output."
+"      slower than `'deterministic'`, but may produce more human-readable output.\n"
+"elide_implied_tag : bool, optional\n"
+"    Only used with type-directed encoding (``type=``). If True, a tagged\n"
+"    struct's tag is omitted whenever the target type is that concrete\n"
+"    struct (rather than a union), since the tag is implied by the type.\n"
+"    Positional (``array_like``) structs always keep their tag. Defaults\n"
+"    to False.\n"
 );
 
 enum mpack_code {
@@ -14591,10 +14620,11 @@ cleanup:;
 
 static int
 mpack_encode_struct_object_typed(
-    EncoderState *self, StructMetaObject *st, PyObject *obj, StructInfo *info
+    EncoderState *self, StructMetaObject *st, PyObject *obj, StructInfo *info,
+    bool elide_tag
 ) {
     PyObject *tag_value = st->struct_tag_value;
-    int tagged = tag_value != NULL;
+    int tagged = tag_value != NULL && !elide_tag;
     PyObject *fields = st->struct_encode_fields;
     Py_ssize_t nfields = PyTuple_GET_SIZE(fields);
     Py_ssize_t len = nfields + tagged;
@@ -14658,17 +14688,31 @@ cleanup:
 }
 
 static int
-mpack_encode_struct_typed(EncoderState *self, PyObject *obj) {
+mpack_encode_struct_typed(EncoderState *self, PyObject *obj, bool elide_tag) {
     StructMetaObject *st = (StructMetaObject *)Py_TYPE(obj);
     if (MS_UNLIKELY(self->order == ORDER_SORTED)) return mpack_encode_struct(self, obj);
     PyObject *info_obj = StructInfo_Convert((PyObject *)st);
     if (info_obj == NULL) return -1;
     StructInfo *info = (StructInfo *)info_obj;
+    /* array-like structs are positional: their tag is never elided, since the
+     * decoder needs it to hold a fixed slot. */
     int status = (st->array_like == OPT_TRUE)
         ? mpack_encode_struct_array_typed(self, st, obj, info)
-        : mpack_encode_struct_object_typed(self, st, obj, info);
+        : mpack_encode_struct_object_typed(self, st, obj, info, elide_tag);
     Py_DECREF(info_obj);
     return status;
+}
+
+/* Whether a typed encode against `type` may skip a struct's tag: only when
+ * `elide_implied_tag` is enabled and the target is a single concrete struct
+ * type (not a union), so the tag carries no information. */
+static MS_INLINE bool
+ms_tag_implied(EncoderState *self, uint64_t t) {
+    return (
+        self->elide_implied_tag
+        && (t & MS_TYPE_STRUCT)
+        && !(t & (MS_TYPE_STRUCT_UNION | MS_TYPE_STRUCT_ARRAY_UNION))
+    );
 }
 
 static int
@@ -14681,7 +14725,7 @@ mpack_encode_typed(EncoderState *self, PyObject *obj, TypeNode *type) {
         return mpack_encode_float32(self, obj);
     }
     if (ms_is_struct_type(pt)) {
-        return mpack_encode_struct_typed(self, obj);
+        return mpack_encode_struct_typed(self, obj, ms_tag_implied(self, t));
     }
     if (pt == &PyList_Type && (t & MS_TYPE_LIST)) {
         int r;
@@ -14766,7 +14810,7 @@ static PyTypeObject Encoder_Type = {
 };
 
 PyDoc_STRVAR(msgspec_msgpack_encode__doc__,
-"msgpack_encode(obj, *, enc_hook=None, order=None)\n"
+"msgpack_encode(obj, *, enc_hook=None, order=None, type=None, elide_implied_tag=False)\n"
 "--\n"
 "\n"
 "Serialize an object as MessagePack.\n"
@@ -14791,6 +14835,12 @@ PyDoc_STRVAR(msgspec_msgpack_encode__doc__,
 "    - `'sorted'`: Like `'deterministic'`, but *all* object-like types (structs,\n"
 "      dataclasses, ...) are also sorted by field name before encoding. This is\n"
 "      slower than `'deterministic'`, but may produce more human-readable output.\n"
+"elide_implied_tag : bool, optional\n"
+"    Only used with type-directed encoding (``type=``). If True, a tagged\n"
+"    struct's tag is omitted whenever the target type is that concrete\n"
+"    struct (rather than a union), since the tag is implied by the type.\n"
+"    Positional (``array_like``) structs always keep their tag. Defaults\n"
+"    to False.\n"
 "\n"
 "Returns\n"
 "-------\n"
@@ -14812,7 +14862,7 @@ msgspec_msgpack_encode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
  *************************************************************************/
 
 PyDoc_STRVAR(JSONEncoder__doc__,
-"Encoder(*, enc_hook=None, decimal_format='string', uuid_format='canonical', order=None)\n"
+"Encoder(*, enc_hook=None, decimal_format='string', uuid_format='canonical', order=None, type=None, elide_implied_tag=False)\n"
 "--\n"
 "\n"
 "A JSON encoder.\n"
@@ -14846,7 +14896,13 @@ PyDoc_STRVAR(JSONEncoder__doc__,
 "      encoded binary output is necessary.\n"
 "    - `'sorted'`: Like `'deterministic'`, but *all* object-like types (structs,\n"
 "      dataclasses, ...) are also sorted by field name before encoding. This is\n"
-"      slower than `'deterministic'`, but may produce more human-readable output."
+"      slower than `'deterministic'`, but may produce more human-readable output.\n"
+"elide_implied_tag : bool, optional\n"
+"    Only used with type-directed encoding (``type=``). If True, a tagged\n"
+"    struct's tag is omitted whenever the target type is that concrete\n"
+"    struct (rather than a union), since the tag is implied by the type.\n"
+"    Positional (``array_like``) structs always keep their tag. Defaults\n"
+"    to False.\n"
 );
 
 static int json_encode_inline(EncoderState*, PyObject*);
@@ -15862,7 +15918,8 @@ cleanup:;
 
 static int
 json_encode_struct_object_typed(
-    EncoderState *self, StructMetaObject *st, PyObject *obj, StructInfo *info
+    EncoderState *self, StructMetaObject *st, PyObject *obj, StructInfo *info,
+    bool elide_tag
 ) {
     PyObject *fields = st->struct_encode_fields;
     PyObject *defaults = st->struct_defaults;
@@ -15873,7 +15930,7 @@ json_encode_struct_object_typed(
     Py_ssize_t start_len = self->output_len;
     if (Py_EnterRecursiveCall(" while serializing an object")) return -1;
     int status = -1;
-    if (st->struct_tag_value != NULL) {
+    if (st->struct_tag_value != NULL && !elide_tag) {
         if (json_encode_str(self, st->struct_tag_field) < 0) goto cleanup;
         if (ms_write(self, ":", 1) < 0) goto cleanup;
         if (json_encode_struct_tag(self, st->struct_tag_value) < 0) goto cleanup;
@@ -15930,7 +15987,7 @@ cleanup:
 }
 
 static int
-json_encode_struct_typed(EncoderState *self, PyObject *obj) {
+json_encode_struct_typed(EncoderState *self, PyObject *obj, bool elide_tag) {
     StructMetaObject *st = (StructMetaObject *)Py_TYPE(obj);
     /* The sorted-order path uses a separate AssocList machinery; fall back to
      * value-directed there (its int fields won't be hex-encoded). */
@@ -15939,10 +15996,11 @@ json_encode_struct_typed(EncoderState *self, PyObject *obj) {
     if (info_obj == NULL) return -1;
     StructInfo *info = (StructInfo *)info_obj;
     int status;
+    /* array-like structs are positional: their tag is never elided. */
     if (st->array_like == OPT_TRUE)
         status = json_encode_struct_array_typed(self, st, obj, info);
     else
-        status = json_encode_struct_object_typed(self, st, obj, info);
+        status = json_encode_struct_object_typed(self, st, obj, info, elide_tag);
     Py_DECREF(info_obj);
     return status;
 }
@@ -15960,7 +16018,7 @@ json_encode_typed(EncoderState *self, PyObject *obj, TypeNode *type) {
         return json_encode_int_hex(self, obj, type->itype, force_hex);
     }
     if (ms_is_struct_type(pt)) {
-        return json_encode_struct_typed(self, obj);
+        return json_encode_struct_typed(self, obj, ms_tag_implied(self, t));
     }
     if (pt == &PyList_Type && (t & MS_TYPE_LIST)) {
         int r;
@@ -16256,7 +16314,7 @@ static PyTypeObject JSONEncoder_Type = {
 };
 
 PyDoc_STRVAR(msgspec_json_encode__doc__,
-"json_encode(obj, *, enc_hook=None, order=None)\n"
+"json_encode(obj, *, enc_hook=None, order=None, type=None, elide_implied_tag=False)\n"
 "--\n"
 "\n"
 "Serialize an object as JSON.\n"
@@ -16281,6 +16339,12 @@ PyDoc_STRVAR(msgspec_json_encode__doc__,
 "    - `'sorted'`: Like `'deterministic'`, but *all* object-like types (structs,\n"
 "      dataclasses, ...) are also sorted by field name before encoding. This is\n"
 "      slower than `'deterministic'`, but may produce more human-readable output.\n"
+"elide_implied_tag : bool, optional\n"
+"    Only used with type-directed encoding (``type=``). If True, a tagged\n"
+"    struct's tag is omitted whenever the target type is that concrete\n"
+"    struct (rather than a union), since the tag is implied by the type.\n"
+"    Positional (``array_like``) structs always keep their tag. Defaults\n"
+"    to False.\n"
 "\n"
 "Returns\n"
 "-------\n"
@@ -24162,6 +24226,7 @@ msgspec_clear(PyObject *m)
     Py_CLEAR(st->str_dec_tensor);
     Py_CLEAR(st->str_strict);
     Py_CLEAR(st->str_order);
+    Py_CLEAR(st->str_elide_implied_tag);
     Py_CLEAR(st->str_utcoffset);
     Py_CLEAR(st->str___origin__);
     Py_CLEAR(st->str___args__);
@@ -24621,6 +24686,7 @@ PyInit__core(void)
     CACHED_STRING(str_numpy, "numpy");
     CACHED_STRING(str_strict, "strict");
     CACHED_STRING(str_order, "order");
+    CACHED_STRING(str_elide_implied_tag, "elide_implied_tag");
     CACHED_STRING(str_utcoffset, "utcoffset");
     CACHED_STRING(str___origin__, "__origin__");
     CACHED_STRING(str___args__, "__args__");

@@ -886,6 +886,7 @@ def codec(
     tensor_encoder: str | None = None,
     tensor_decoder: str | None = None,
     force_int64: bool = False,
+    elide_implied_tag: bool = False,
 ) -> str:
     """Generate TypeScript type definitions plus a MessagePack/JSON codec.
 
@@ -915,6 +916,12 @@ def codec(
         (default ``True``).
     tensor_encoder, tensor_decoder, force_int64
         Only used when ``embed_msgpack=False`` (the ``@msgpack/msgpack`` path).
+    elide_implied_tag : bool, optional
+        Omit a tagged struct's tag wherever the schema position is that
+        concrete struct (rather than a union), matching a Python encoder
+        constructed with ``elide_implied_tag=True``. Union positions still
+        emit and dispatch on the tag. Only supported with
+        ``embed_msgpack=True``. Defaults to ``False``.
 
     Returns
     -------
@@ -924,11 +931,17 @@ def codec(
     if not (msgpack or json):
         raise ValueError("at least one of `msgpack` / `json` must be enabled")
     if embed_msgpack:
-        return _codec_embed(type, msgpack, json)
+        return _codec_embed(type, msgpack, json, elide_implied_tag)
+    if elide_implied_tag:
+        raise ValueError(
+            "`elide_implied_tag` requires `embed_msgpack=True`"
+        )
     return _codec_external(type, tensor_encoder, tensor_decoder, force_int64)
 
 
-def _codec_embed(type: Any, msgpack: bool, json: bool) -> str:
+def _codec_embed(
+    type: Any, msgpack: bool, json: bool, elide_implied_tag: bool = False
+) -> str:
     from . import _javascript as _js
 
     type_infos = mi.multi_type_info([type], aliases=True)
@@ -937,7 +950,7 @@ def _codec_embed(type: Any, msgpack: bool, json: bool) -> str:
     name_map = _build_name_map(component_types)
 
     schema_gen = _SchemaGenerator(name_map, embed=True)
-    jsgen = _js._CodecGenerator(name_map)
+    jsgen = _js._CodecGenerator(name_map, elide_implied_tag=elide_implied_tag)
 
     parts = [_MSGPACK_RUNTIME_TS.strip()]
     if _contains_tensor(root):
@@ -967,12 +980,14 @@ def _codec_embed(type: Any, msgpack: bool, json: bool) -> str:
 
     if msgpack:
         for nm, t in struct_components():
+            if jsgen._elidable(t):
+                enc_sig_js = f"encode{nm}(w, v, tagged)"
+                enc_sig_ts = f"encode{nm}(w: Writer, v: {nm}, tagged: boolean): void"
+            else:
+                enc_sig_js = f"encode{nm}(w, v)"
+                enc_sig_ts = f"encode{nm}(w: Writer, v: {nm}): void"
             parts.append(
-                _ts_sig_swap(
-                    jsgen.enc_def(nm, t),
-                    f"encode{nm}(w, v)",
-                    f"encode{nm}(w: Writer, v: {nm}): void",
-                )
+                _ts_sig_swap(jsgen.enc_def(nm, t), enc_sig_js, enc_sig_ts)
             )
             dec = _ts_sig_swap(
                 jsgen.dec_def(nm, t),
@@ -999,13 +1014,16 @@ def _codec_embed(type: Any, msgpack: bool, json: bool) -> str:
 
     if json:
         for nm, t in struct_components():
-            parts.append(
-                _ts_sig_swap(
-                    jsgen.json_enc_def(nm, t),
-                    f"encodeJson{nm}(v)",
-                    f"encodeJson{nm}(v: {nm}): any",
-                )
-            )
+            if jsgen._elidable(t):
+                jenc_sig_js = f"encodeJson{nm}(v, tagged)"
+                jenc_sig_ts = f"encodeJson{nm}(v: {nm}, tagged: boolean): any"
+            else:
+                jenc_sig_js = f"encodeJson{nm}(v)"
+                jenc_sig_ts = f"encodeJson{nm}(v: {nm}): any"
+            jenc = _ts_sig_swap(jsgen.json_enc_def(nm, t), jenc_sig_js, jenc_sig_ts)
+            # the elidable-tag accumulator is built untyped
+            jenc = jenc.replace("const o = tagged ?", "const o: any = tagged ?")
+            parts.append(jenc)
             parts.append(
                 _ts_sig_swap(
                     jsgen.json_dec_def(nm, t),

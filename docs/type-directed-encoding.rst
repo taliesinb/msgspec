@@ -70,3 +70,41 @@ to JavaScript ``bigint`` (decoded from hex when large), ``bytes`` to
 ``Uint8Array``, and ``Float32`` to a 5-byte MessagePack float. Encode on the
 Python side with ``type=`` and the generated JS/TS ``json`` / ``msgpack``
 decoders read it back losslessly.
+
+
+Eliding implied tags (``elide_implied_tag``)
+--------------------------------------------
+
+A :ref:`tagged struct <struct-tagged-unions>` normally emits its tag field
+every time it's encoded - the tag is a property of the class, not of the
+position it appears in. But when encoding against a type, the target often
+already *implies* the struct's identity: encoding a ``list[Foo]`` doesn't need
+a tag on each element, while a ``list[FooBar]`` union does.
+
+Passing ``elide_implied_tag=True`` to a type-directed encoder (``Encoder`` or
+module-level ``encode``, JSON and MessagePack alike) omits the tag wherever the
+target position is a single concrete struct type, and keeps it wherever the
+position is a union (including an abstract struct)::
+
+    class Shape(Struct, tag_field="kind", abstract=True): ...
+    class Circle(Shape): r: float
+    class Square(Shape): side: float
+
+    msgspec.json.encode([Circle(r=1.0)], type=list[Circle], elide_implied_tag=True)
+    # b'[{"r":1.0}]'                       <- tag implied by the target
+    msgspec.json.encode([Circle(r=1.0)], type=list[Shape], elide_implied_tag=True)
+    # b'[{"kind":"Circle","r":1.0}]'       <- union still needs the tag
+
+Notes:
+
+- **Decoding needs no flag**: for a concrete struct target the tag is already
+  optional-but-validated, so elided messages decode with any type-directed
+  decoder. Union targets still dispatch on the (present) tag.
+- **Positional structs are exempt**: an ``array_like=True`` struct's tag
+  occupies a fixed slot, so it is always emitted.
+- **The trade-off**: with tags elided the bytes are no longer self-describing -
+  a message encoded against ``list[Circle]`` can't later be decoded against
+  ``list[Shape]`` or as ``Any``. Use it when both ends share the exact schema
+  (e.g. with a generated :doc:`JavaScript <javascript>`/:doc:`TypeScript
+  <typescript>` codec, which accept the same ``elide_implied_tag=True`` option
+  in ``codec()`` and stay byte-compatible).

@@ -113,7 +113,9 @@ round-trip as native ``bigint`` (hex strings in JSON when large), ``bytes`` are
 ``Uint8Array`` (base64 in JSON), and ``Float32`` is a 5-byte MessagePack float.
 The transformation is *structural* - no runtime validation is performed;
 tagged-union structs emit their discriminant tag when encoding and are
-dispatched on it when decoding.
+dispatched on it when decoding. Pass ``elide_implied_tag=True`` to omit the tag
+wherever the schema position is a single concrete struct (union positions keep
+it), matching a Python encoder constructed with the same option.
 
 Which namespaces to emit is controlled by the ``msgpack`` / ``json`` flags
 (both ``True`` by default). Struct shapes are emitted as ``interface`` (the
