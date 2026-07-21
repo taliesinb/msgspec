@@ -63,6 +63,18 @@ def _int_method(t: mi.IntType) -> str:
     return "int64" if t.itype in _BIGINT_ITYPES else "int"
 
 
+def _lit_str(m) -> bool:
+    """A LiteralType whose values are all strings (encodes/decodes like str)."""
+    return isinstance(m, mi.LiteralType) and all(isinstance(v, str) for v in m.values)
+
+
+def _lit_int(m) -> bool:
+    """A LiteralType whose values are all ints (encodes/decodes like int)."""
+    return isinstance(m, mi.LiteralType) and all(
+        isinstance(v, int) and not isinstance(v, bool) for v in m.values
+    )
+
+
 def _is_bigint(t: mi.Type) -> bool:
     return isinstance(t, mi.IntType) and t.itype in _BIGINT_ITYPES
 
@@ -325,10 +337,11 @@ class _CodecGenerator:
         has_bigint = any(_is_bigint(m) for m in others)
         has_float = any(isinstance(m, mi.FloatType) for m in others)
         has_int = any(
-            isinstance(m, mi.IntType) and not _is_bigint(m) for m in others
+            (isinstance(m, mi.IntType) and not _is_bigint(m)) or _lit_int(m)
+            for m in others
         )
         has_bool = any(isinstance(m, mi.BoolType) for m in others)
-        has_str = any(isinstance(m, mi.StrType) for m in others)
+        has_str = any(isinstance(m, mi.StrType) or _lit_str(m) for m in others)
         has_bytes = any(
             isinstance(m, (mi.BytesType, mi.ByteArrayType, mi.MemoryViewType))
             for m in others
@@ -454,7 +467,7 @@ class _CodecGenerator:
             lines.append("if (_t === 0xca || _t === 0xcb) return r.float();")
         if any(isinstance(m, mi.BoolType) for m in others):
             lines.append("if (_t === 0xc2 || _t === 0xc3) return r.bool();")
-        if any(isinstance(m, mi.StrType) for m in others):
+        if any(isinstance(m, mi.StrType) or _lit_str(m) for m in others):
             lines.append(
                 "if ((_t >= 0xa0 && _t <= 0xbf) || _t === 0xd9 || _t === 0xda || _t === 0xdb) return r.str();"
             )
@@ -494,7 +507,7 @@ class _CodecGenerator:
             )
         if any(_is_bigint(m) for m in others):
             lines.append("return r.int64();")
-        elif any(isinstance(m, mi.IntType) for m in others):
+        elif any(isinstance(m, mi.IntType) or _lit_int(m) for m in others):
             lines.append("return r.int();")
         else:
             lines.append('throw new Error("undecodable scalar union");')
