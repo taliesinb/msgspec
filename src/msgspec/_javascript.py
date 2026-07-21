@@ -354,13 +354,19 @@ class _CodecGenerator:
         if has_bytes:
             branches.append((f"{v} instanceof Uint8Array", f"w.bin({v});"))
         # Container members, dispatched by JS runtime shape (checked after the
-        # more specific `Uint8Array`/`Set` cases; a plain object is a dict).
+        # more specific `Uint8Array`/`Set` cases; a plain object is a dict). An UNTAGGED
+        # struct member dispatches by its encoded shape: a map, or an array if array_like.
         arrays = [
             m for m in others
             if isinstance(m, (mi.ListType, mi.VarTupleType, mi.TupleType))
+            or (isinstance(m, mi.StructType) and m.array_like)
         ]
         sets = [m for m in others if isinstance(m, (mi.SetType, mi.FrozenSetType))]
-        maps = [m for m in others if isinstance(m, (mi.DictType, mi.FrozenDictType))]
+        maps = [
+            m for m in others
+            if isinstance(m, (mi.DictType, mi.FrozenDictType))
+            or (isinstance(m, mi.StructType) and not m.array_like)
+        ]
         if len(arrays) > 1 or len(sets) > 1 or len(maps) > 1:
             raise NotImplementedError(
                 "msgspec.javascript codec can't disambiguate a union with multiple "
@@ -457,13 +463,19 @@ class _CodecGenerator:
             for m in others
         ):
             lines.append("if (_t === 0xc4 || _t === 0xc5 || _t === 0xc6) return r.bin();")
-        # Container members, dispatched on the MessagePack tag.
+        # Container members, dispatched on the MessagePack tag. An UNTAGGED struct member
+        # dispatches by its encoded shape: a map, or an array if array_like.
         arrays = [
             m for m in others
             if isinstance(m, (mi.ListType, mi.VarTupleType, mi.TupleType))
+            or (isinstance(m, mi.StructType) and m.array_like)
         ]
         sets = [m for m in others if isinstance(m, (mi.SetType, mi.FrozenSetType))]
-        maps = [m for m in others if isinstance(m, (mi.DictType, mi.FrozenDictType))]
+        maps = [
+            m for m in others
+            if isinstance(m, (mi.DictType, mi.FrozenDictType))
+            or (isinstance(m, mi.StructType) and not m.array_like)
+        ]
         if len(arrays) + len(sets) > 1 or len(maps) > 1:
             raise NotImplementedError(
                 "msgspec.javascript codec can't disambiguate a union with multiple "
