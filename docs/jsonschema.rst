@@ -94,5 +94,34 @@ Example
     }
 
 
+Simplifying unions
+------------------
+
+By default every union renders as an ``anyOf`` of its member schemas, so
+``int | None`` becomes ``{"anyOf": [{"type": "integer"}, {"type": "null"}]}``.
+Passing ``simplify_unions=True`` to `msgspec.json.schema` or
+`msgspec.json.schema_components` collapses such unions into the equivalent
+type-array form wherever it is safe to do so:
+
+.. code-block:: python
+
+    >>> msgspec.json.schema(int | None, simplify_unions=True)
+    {'type': ['integer', 'null']}
+
+A union collapses when every member is a plain type-keyword schema and at most
+one member carries extra constraint keys (which are per-type in JSON Schema, so
+they transfer unambiguously):
+
+.. code-block:: python
+
+    >>> msgspec.json.schema(Annotated[int, Meta(ge=0)] | None, simplify_unions=True)
+    {'type': ['integer', 'null'], 'minimum': 0}
+
+Unions containing ``$ref`` members (structs, enums), literals, or multiple
+constrained members fall back to ``anyOf`` unchanged. The two forms validate
+identically; the type-array form is simply more compact and is handled more
+gracefully by some schema consumers.
+
+
 .. _JSON Schema: https://json-schema.org/
 .. _OpenAPI: https://www.openapis.org/

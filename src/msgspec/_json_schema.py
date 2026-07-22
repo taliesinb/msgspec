@@ -17,6 +17,7 @@ def schema(
     *,
     schema_hook: Callable[[type], dict[str, Any]] | None = None,
     ref_template: str = _REF_TEMPLATE,
+    simplify_unions: bool = False,
 ) -> dict[str, Any]:
     """Generate a JSON Schema for a given type.
 
@@ -41,6 +42,11 @@ def schema(
         somewhere other than a top-level ``"$defs"`` field. For example, you
         might use ``ref_template="#/components/{name}"`` if generating an
         OpenAPI schema.
+    simplify_unions : bool, optional
+        If True, unions whose members are all simple type-keyword schemas are
+        collapsed into a single type-array schema - e.g. ``int | None``
+        renders as ``{"type": ["integer", "null"]}`` instead of an ``anyOf``.
+        Defaults to False.
 
     Returns
     -------
@@ -55,6 +61,7 @@ def schema(
         (type,),
         schema_hook=schema_hook,
         ref_template=ref_template,
+        simplify_unions=simplify_unions,
     )
     if components:
         out["$defs"] = components
@@ -66,6 +73,7 @@ def schema_components(
     *,
     schema_hook: Callable[[type], dict[str, Any]] | None = None,
     ref_template: str = _REF_TEMPLATE,
+    simplify_unions: bool = False,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
     """Generate JSON Schemas for one or more types.
 
@@ -87,6 +95,11 @@ def schema_components(
         somewhere other than a top-level ``"$defs"`` field. For example, you
         might use ``ref_template="#/components/{name}"`` if generating an
         OpenAPI schema.
+    simplify_unions : bool, optional
+        If True, unions whose members are all simple type-keyword schemas are
+        collapsed into a single type-array schema - e.g. ``int | None``
+        renders as ``{"type": ["integer", "null"]}`` instead of an ``anyOf``.
+        Defaults to False.
 
     Returns
     -------
@@ -106,7 +119,7 @@ def schema_components(
 
     name_map = _build_name_map(component_types)
 
-    gen = _SchemaGenerator(name_map, schema_hook, ref_template)
+    gen = _SchemaGenerator(name_map, schema_hook, ref_template, simplify_unions)
 
     schemas = tuple(gen.to_schema(t) for t in type_infos)
 
@@ -223,10 +236,31 @@ class _SchemaGenerator:
         name_map: dict[Any, str],
         schema_hook: Callable[[type], dict[str, Any]] | None = None,
         ref_template: str = "#/$defs/{name}",
+        simplify_unions: bool = False,
     ):
         self.name_map = name_map
         self.schema_hook = schema_hook
         self.ref_template = ref_template
+        self.simplify_unions = simplify_unions
+
+    def _union_anyof(self, options: list[dict[str, Any]]) -> dict[str, Any]:
+        """Render union member schemas, collapsing to a single type-array
+        schema ({"type": ["integer", "null"], ...}) when ``simplify_unions``
+        is enabled and it's safe: every member must be a plain type-keyword
+        schema, and at most one may carry extra (per-type) constraint keys."""
+        if self.simplify_unions and len(options) >= 2:
+            types = []
+            extra: dict[str, Any] = {}
+            for opt in options:
+                tp = opt.get("type")
+                rest = {k: v for k, v in opt.items() if k != "type"}
+                if not isinstance(tp, str) or tp in types or (rest and extra):
+                    break
+                types.append(tp)
+                extra = extra or rest
+            else:
+                return {"type": types, **extra}
+        return {"anyOf": options}
 
     def to_schema(self, t: mi.Type, check_ref: bool = True) -> dict[str, Any]:
         """Converts a Type to a json-schema."""
@@ -381,7 +415,7 @@ class _SchemaGenerator:
                     options.append(struct_schema)
                     if has_none:
                         options.append(self.to_schema(none_member))
-                    schema["anyOf"] = options
+                    schema.update(self._union_anyof(options))
                 elif has_none:
                     schema["anyOf"] = [struct_schema, self.to_schema(none_member)]
                 else:
@@ -391,11 +425,11 @@ class _SchemaGenerator:
                 options.append(self.to_schema(subtype))
                 if has_none:
                     options.append(self.to_schema(none_member))
-                schema["anyOf"] = options
+                schema.update(self._union_anyof(options))
             else:
                 if has_none:
                     options.append(self.to_schema(none_member))
-                schema["anyOf"] = options
+                schema.update(self._union_anyof(options))
         elif isinstance(t, mi.LiteralType):
             # `t.values` may mix types (e.g. `Literal[1, None]`), which a plain
             # `sorted` can't order; reuse the same type-aware sort as

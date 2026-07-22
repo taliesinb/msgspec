@@ -1431,3 +1431,66 @@ def test_multiline_docstring():
             }
         },
     }
+
+
+class TestSimplifyUnions:
+    """`simplify_unions=True` collapses simple unions to type-array schemas."""
+
+    def test_optional_int(self):
+        assert msgspec.json.schema(Union[int, None], simplify_unions=True) == {
+            "type": ["integer", "null"]
+        }
+
+    def test_default_off(self):
+        assert msgspec.json.schema(Union[int, None]) == {
+            "anyOf": [{"type": "integer"}, {"type": "null"}]
+        }
+
+    def test_multi_scalar(self):
+        assert msgspec.json.schema(
+            Union[int, str, None], simplify_unions=True
+        ) == {"type": ["integer", "string", "null"]}
+
+    def test_single_constrained_member(self):
+        typ = Union[Annotated[int, Meta(ge=0)], None]
+        assert msgspec.json.schema(typ, simplify_unions=True) == {
+            "type": ["integer", "null"],
+            "minimum": 0,
+        }
+
+    def test_two_constrained_members_fall_back(self):
+        typ = Union[Annotated[int, Meta(ge=0)], Annotated[str, Meta(max_length=3)]]
+        assert msgspec.json.schema(typ, simplify_unions=True) == {
+            "anyOf": [
+                {"type": "integer", "minimum": 0},
+                {"type": "string", "maxLength": 3},
+            ]
+        }
+
+    def test_struct_member_falls_back(self):
+        class Point(msgspec.Struct):
+            x: int
+
+        res = msgspec.json.schema(Union[Point, None], simplify_unions=True)
+        assert res["anyOf"] == [{"$ref": "#/$defs/Point"}, {"type": "null"}]
+
+    def test_literal_member_falls_back(self):
+        typ = Union[Literal["a", "b"], None]
+        assert msgspec.json.schema(typ, simplify_unions=True) == {
+            "anyOf": [{"enum": ["a", "b"]}, {"type": "null"}]
+        }
+
+    def test_struct_field(self):
+        class Foo(msgspec.Struct):
+            bar: Union[int, None]
+
+        res = msgspec.json.schema(Foo, simplify_unions=True)
+        assert res["$defs"]["Foo"]["properties"]["bar"] == {
+            "type": ["integer", "null"]
+        }
+
+    def test_schema_components(self):
+        (out,), components = msgspec.json.schema_components(
+            (Union[int, None],), simplify_unions=True
+        )
+        assert out == {"type": ["integer", "null"]}
