@@ -241,6 +241,39 @@ def test_abstract_json_schema(zoo):
     assert set(schema["$defs"]) == {"Cat", "Dog"}
 
 
+def test_abstract_json_schema_in_union_with_struct(zoo):
+    # An abstract member of a union alongside another tagged struct must
+    # flatten into its concretes in the discriminator mapping (previously
+    # KeyError: the abstract class has no component entry).
+    from typing import Union
+
+    Animal, Cat, Dog = zoo
+
+    class Robot(Struct, tag_field="kind", tag="robot"):
+        model: str
+
+    class Holder(Struct):
+        pet: Union[Animal, Robot]
+
+    schema = msgspec.json.schema(Holder)
+    prop = schema["$defs"]["Holder"]["properties"]["pet"]
+    assert set(prop["discriminator"]["mapping"]) == {"cat", "dog", "robot"}
+    assert set(schema["$defs"]) == {"Holder", "Cat", "Dog", "Robot"}
+
+
+def test_abstract_json_schema_optional_field(zoo):
+    Animal, Cat, Dog = zoo
+
+    class Holder(Struct):
+        pet: Animal | None = None
+
+    schema = msgspec.json.schema(Holder)
+    prop = schema["$defs"]["Holder"]["properties"]["pet"]
+    (union_schema, null_schema) = prop["anyOf"]
+    assert set(union_schema["discriminator"]["mapping"]) == {"cat", "dog"}
+    assert null_schema == {"type": "null"}
+
+
 # --- TypeScript ------------------------------------------------------------
 
 

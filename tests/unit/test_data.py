@@ -628,3 +628,59 @@ class TestArray:
 
         assert type_info(Array[Float32, 8]) == ArrayType(dtype="float32", size=8)
         assert type_info(Array) == ArrayType(dtype=None, size=None)
+
+
+class TestJsonSchema:
+    """Tensor/Array types render as their self-describing JSON object form."""
+
+    def test_tensor_schema(self):
+        from msgspec.data import Float32, Tensor
+
+        class Model(msgspec.Struct):
+            weights: Tensor[2, Float32]
+
+        schema = msgspec.json.schema(Model)
+        prop = schema["$defs"]["Model"]["properties"]["weights"]
+        assert prop["type"] == "object"
+        assert prop["properties"]["type"] == {"enum": ["tensor"]}
+        assert prop["properties"]["dtype"] == {"enum": ["float32"]}
+        assert prop["properties"]["shape"] == {
+            "type": "array",
+            "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+            "minItems": 2,
+            "maxItems": 2,
+        }
+        assert prop["properties"]["data"] == {
+            "type": "string",
+            "contentEncoding": "base64",
+        }
+        assert prop["required"] == ["type", "shape", "dtype", "data"]
+
+    def test_tensor_schema_untyped(self):
+        from msgspec.data import Tensor
+
+        schema = msgspec.json.schema(Tensor)
+        assert schema["properties"]["dtype"] == {"type": "string"}
+        assert "anyOf" in schema["properties"]["shape"]
+
+    def test_tensor_schema_sized(self):
+        from msgspec.data import Tensor, UInt8
+
+        schema = msgspec.json.schema(Tensor[(2, 3), UInt8])
+        assert schema["properties"]["shape"]["prefixItems"] == [
+            {"enum": [2]},
+            {"enum": [3]},
+        ]
+
+    def test_array_schema(self):
+        from msgspec.data import Array, UInt8
+
+        schema = msgspec.json.schema(Array[UInt8, 4])
+        assert schema["properties"]["dtype"] == {"enum": ["uint8"]}
+        assert schema["properties"]["shape"]["prefixItems"] == [{"enum": [4]}]
+
+    def test_array_schema_unsized(self):
+        from msgspec.data import Array, UInt8
+
+        schema = msgspec.json.schema(Array[UInt8])
+        assert "anyOf" in schema["properties"]["shape"]

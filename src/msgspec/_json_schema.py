@@ -340,7 +340,20 @@ class _SchemaGenerator:
             has_none = False
             none_member = None
             tag_field = None
+            members = []
             for subtype in t.types:
+                real_type = subtype
+                while isinstance(real_type, mi.Metadata):
+                    real_type = real_type.type
+                if isinstance(real_type, mi.AbstractStructType):
+                    # An abstract struct member behaves as the union of its
+                    # concrete descendants - flatten them in so they join the
+                    # discriminator mapping (the abstract class itself has no
+                    # component entry).
+                    members.extend(real_type.concrete_union_type.types)
+                else:
+                    members.append(subtype)
+            for subtype in members:
                 real_type = subtype
                 while isinstance(real_type, mi.Metadata):
                     real_type = real_type.type
@@ -458,6 +471,43 @@ class _SchemaGenerator:
                 schema["type"] = "object"
                 schema["properties"] = dict(zip(names, fields))
                 schema["required"] = required
+        elif isinstance(t, (mi.TensorType, mi.ArrayType)):
+            # Tensors/arrays encode to JSON as a self-describing object with
+            # base64 data: {"type": "tensor", "shape", "dtype", "data"}.
+            if isinstance(t, mi.TensorType):
+                dtype, sizes = t.dtype, t.sizes
+                if sizes is None and t.ndims is not None:
+                    sizes = (None,) * t.ndims
+            else:
+                dtype = t.dtype
+                sizes = None if t.size is None else (t.size,)
+            if sizes is None:
+                shape_schema = {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "integer"}},
+                        {"type": "null"},
+                    ]
+                }
+            else:
+                shape_schema = {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "integer"} if s is None else {"enum": [s]}
+                        for s in sizes
+                    ],
+                    "minItems": len(sizes),
+                    "maxItems": len(sizes),
+                }
+            schema["type"] = "object"
+            schema["properties"] = {
+                "type": {"enum": ["tensor"]},
+                "shape": shape_schema,
+                "dtype": (
+                    {"type": "string"} if dtype is None else {"enum": [dtype]}
+                ),
+                "data": {"type": "string", "contentEncoding": "base64"},
+            }
+            schema["required"] = ["type", "shape", "dtype", "data"]
         elif isinstance(t, mi.ExtType):
             raise TypeError("json-schema doesn't support msgpack Ext types")
         elif isinstance(t, mi.CustomType):
