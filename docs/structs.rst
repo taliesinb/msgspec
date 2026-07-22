@@ -645,6 +645,10 @@ The concrete descendants must form a valid :ref:`tagged union <struct-tagged-uni
 (the example above tags them via ``tag``/``tag_field`` on the base). This works
 everywhere a type is accepted - nested fields, `msgspec.json.schema`,
 `msgspec.typescript`, and `msgspec.inspect` all treat ``Command`` as the union.
+In generated JSON schemas the abstract struct is itself a named ``$defs``
+component (defined once as the tagged union of its concretes, with a
+``discriminator``) and every use site references it, mirroring the named
+``type Command = Get | Put`` alias `msgspec.typescript` emits.
 
 The ``abstract`` kwarg accepts a bool or a callable:
 

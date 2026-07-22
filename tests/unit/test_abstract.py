@@ -235,16 +235,20 @@ def test_inspect_concrete_is_plain_struct_type(zoo):
 def test_abstract_json_schema(zoo):
     Animal, Cat, Dog = zoo
     schema = msgspec.json.schema(Animal)
-    assert "anyOf" in schema
-    assert schema["discriminator"]["propertyName"] == "kind"
-    assert set(schema["discriminator"]["mapping"]) == {"cat", "dog"}
-    assert set(schema["$defs"]) == {"Cat", "Dog"}
+    # The abstract struct is itself a named component...
+    assert schema["$ref"] == "#/$defs/Animal"
+    assert set(schema["$defs"]) == {"Animal", "Cat", "Dog"}
+    # ...defined as the tagged union of its concretes.
+    defn = schema["$defs"]["Animal"]
+    assert defn["anyOf"] == [{"$ref": "#/$defs/Cat"}, {"$ref": "#/$defs/Dog"}]
+    assert defn["discriminator"]["propertyName"] == "kind"
+    assert set(defn["discriminator"]["mapping"]) == {"cat", "dog"}
 
 
 def test_abstract_json_schema_in_union_with_struct(zoo):
-    # An abstract member of a union alongside another tagged struct must
-    # flatten into its concretes in the discriminator mapping (previously
-    # KeyError: the abstract class has no component entry).
+    # An abstract member of a union alongside another tagged struct renders
+    # as a $ref to its own named component (previously a KeyError: the
+    # abstract class had no component entry).
     from typing import Union
 
     Animal, Cat, Dog = zoo
@@ -257,8 +261,22 @@ def test_abstract_json_schema_in_union_with_struct(zoo):
 
     schema = msgspec.json.schema(Holder)
     prop = schema["$defs"]["Holder"]["properties"]["pet"]
-    assert set(prop["discriminator"]["mapping"]) == {"cat", "dog", "robot"}
-    assert set(schema["$defs"]) == {"Holder", "Cat", "Dog", "Robot"}
+    assert sorted(prop["anyOf"], key=str) == [
+        {"$ref": "#/$defs/Animal"},
+        {"$ref": "#/$defs/Robot"},
+    ]
+    assert set(schema["$defs"]) == {"Holder", "Animal", "Cat", "Dog", "Robot"}
+
+
+def test_abstract_json_schema_field_is_ref(zoo):
+    Animal, Cat, Dog = zoo
+
+    class Holder(Struct):
+        pet: Animal
+
+    schema = msgspec.json.schema(Holder)
+    prop = schema["$defs"]["Holder"]["properties"]["pet"]
+    assert prop == {"$ref": "#/$defs/Animal"}
 
 
 def test_abstract_json_schema_optional_field(zoo):
@@ -269,9 +287,10 @@ def test_abstract_json_schema_optional_field(zoo):
 
     schema = msgspec.json.schema(Holder)
     prop = schema["$defs"]["Holder"]["properties"]["pet"]
-    (union_schema, null_schema) = prop["anyOf"]
-    assert set(union_schema["discriminator"]["mapping"]) == {"cat", "dog"}
-    assert null_schema == {"type": "null"}
+    assert prop["anyOf"] == [
+        {"$ref": "#/$defs/Animal"},
+        {"type": "null"},
+    ]
 
 
 # --- TypeScript ------------------------------------------------------------

@@ -159,9 +159,12 @@ def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type
                 components[t.cls] = t
                 collect(t.value)
         elif isinstance(t, mi.AbstractStructType):
-            # An abstract struct is transparent - it behaves as the union of
-            # its concrete descendants, so collect those instead.
-            collect(t.concrete_union_type)
+            # An abstract struct is itself a named component (defined as the
+            # tagged union of its concrete descendants), which are collected
+            # alongside it.
+            if t.cls not in components:
+                components[t.cls] = t
+                collect(t.concrete_union_type)
         elif isinstance(
             t, (mi.StructType, mi.TypedDictType, mi.DataclassType, mi.NamedTupleType)
         ):
@@ -397,24 +400,16 @@ class _SchemaGenerator:
             has_none = False
             none_member = None
             tag_field = None
-            members = []
             for subtype in t.types:
                 real_type = subtype
                 while isinstance(real_type, mi.Metadata):
                     real_type = real_type.type
                 if isinstance(real_type, mi.AbstractStructType):
-                    # An abstract struct member behaves as the union of its
-                    # concrete descendants - flatten them in so they join the
-                    # discriminator mapping (the abstract class itself has no
-                    # component entry).
-                    members.extend(real_type.concrete_union_type.types)
-                else:
-                    members.append(subtype)
-            for subtype in members:
-                real_type = subtype
-                while isinstance(real_type, mi.Metadata):
-                    real_type = real_type.type
-                if isinstance(real_type, mi.StructType) and not real_type.array_like:
+                    # An abstract struct is a named component (itself a tagged
+                    # union of its concretes) - reference it rather than
+                    # flattening it into this union's discriminator.
+                    other.append(subtype)
+                elif isinstance(real_type, mi.StructType) and not real_type.array_like:
                     tag_field = real_type.tag_field
                     structs[real_type.tag] = real_type
                 elif isinstance(real_type, mi.NoneType):
