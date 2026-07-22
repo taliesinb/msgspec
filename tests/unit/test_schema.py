@@ -1562,3 +1562,42 @@ class TestSchemaAliases:
         assert res["$ref"] == "#/$defs/Pt"
         assert res["$defs"]["Pt"] == {"$ref": "#/$defs/Point"}
         assert res["$defs"]["Point"]["type"] == "object"
+
+
+class TestRecursiveAliases:
+    """Recursive PEP 695 aliases work with aliases=True (via $defs refs)."""
+
+    def _make(self):
+        ns = {}
+        exec("type JSON = int | str | list[JSON] | dict[str, JSON]", ns)
+        return ns["JSON"]
+
+    def test_type_info_cycle(self):
+        JSON = self._make()
+        t = msgspec.inspect.type_info(JSON, aliases=True)
+        assert type(t).__name__ == "AliasType"
+        assert t.value.types[2].item_type is t
+
+    def test_schema_recursive_defs(self):
+        JSON = self._make()
+        res = msgspec.json.schema(JSON, aliases=True)
+        assert res["$ref"] == "#/$defs/JSON"
+        opts = res["$defs"]["JSON"]["anyOf"]
+        assert opts[2] == {"type": "array", "items": {"$ref": "#/$defs/JSON"}}
+        assert opts[3] == {
+            "type": "object",
+            "additionalProperties": {"$ref": "#/$defs/JSON"},
+        }
+
+    def test_inlining_raises_clear_error(self):
+        JSON = self._make()
+        with pytest.raises(TypeError, match="aliases=True"):
+            msgspec.json.schema(JSON)
+        with pytest.raises(TypeError, match="aliases=True"):
+            msgspec.inspect.type_info(JSON)
+
+    def test_typescript_schema(self):
+        JSON = self._make()
+        out = msgspec.typescript.schema(JSON)
+        assert "export type JSON =" in out
+        assert "Array<JSON>" in out

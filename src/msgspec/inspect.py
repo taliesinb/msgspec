@@ -933,8 +933,23 @@ class _Translator:
         # First construct a decoder to validate the types are valid
         from ._core import MsgpackDecoder
 
-        MsgpackDecoder(tuple[self.types])
-        return tuple(self.translate(t) for t in self.types)
+        try:
+            MsgpackDecoder(tuple[self.types])
+        except RecursionError:
+            # The C type analyzer expands type aliases eagerly, so a recursive
+            # alias (`type JSON = int | list[JSON]`) overflows here even
+            # though the Python translator handles the cycle fine (with
+            # `aliases=True`). Skip eager validation; translation will raise
+            # its own error if a type is genuinely unsupported.
+            pass
+        try:
+            return tuple(self.translate(t) for t in self.types)
+        except RecursionError:
+            raise TypeError(
+                "Encountered a recursive type alias. These can only be "
+                "represented by reference - pass `aliases=True` to keep "
+                "named aliases instead of inlining them"
+            ) from None
 
     def translate(self, typ):
         # Fast-path `msgspec.data` types. Both are gated by a cheap `type(typ)
