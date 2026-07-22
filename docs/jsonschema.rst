@@ -123,5 +123,24 @@ identically; the type-array form is simply more compact and is handled more
 gracefully by some schema consumers.
 
 
+Named type aliases
+------------------
+
+By default named type aliases (a `typing.NewType` or a :pep:`695` ``type X =
+...``) are transparently resolved and inlined at each use site. Passing
+``aliases=True`` names them as components instead, mirroring
+``msgspec.inspect.type_info(..., aliases=True)``:
+
+.. code-block:: python
+
+    >>> type Lit = Literal["a", "b", "c"]
+    >>> msgspec.json.schema(Lit, aliases=True)
+    {'$ref': '#/$defs/Lit', '$defs': {'Lit': {'enum': ['a', 'b', 'c']}}}
+
+Generic alias specializations get distinct names (``Vec[int]`` →
+``Vec_int_``), and an alias of an already-named type (e.g. a Struct) becomes a
+``$ref`` to that type's component.
+
+
 .. _JSON Schema: https://json-schema.org/
 .. _OpenAPI: https://www.openapis.org/

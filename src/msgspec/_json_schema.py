@@ -18,6 +18,7 @@ def schema(
     schema_hook: Callable[[type], dict[str, Any]] | None = None,
     ref_template: str = _REF_TEMPLATE,
     simplify_unions: bool = False,
+    aliases: bool = False,
 ) -> dict[str, Any]:
     """Generate a JSON Schema for a given type.
 
@@ -47,6 +48,11 @@ def schema(
         collapsed into a single type-array schema - e.g. ``int | None``
         renders as ``{"type": ["integer", "null"]}`` instead of an ``anyOf``.
         Defaults to False.
+    aliases : bool, optional
+        If True, named type aliases (a `typing.NewType` or a :pep:`695`
+        ``type X = ...``) become their own named ``$defs`` components,
+        referenced wherever they're used. If False (the default) aliases are
+        transparently resolved to their underlying type and inlined.
 
     Returns
     -------
@@ -62,6 +68,7 @@ def schema(
         schema_hook=schema_hook,
         ref_template=ref_template,
         simplify_unions=simplify_unions,
+        aliases=aliases,
     )
     if components:
         out["$defs"] = components
@@ -74,6 +81,7 @@ def schema_components(
     schema_hook: Callable[[type], dict[str, Any]] | None = None,
     ref_template: str = _REF_TEMPLATE,
     simplify_unions: bool = False,
+    aliases: bool = False,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
     """Generate JSON Schemas for one or more types.
 
@@ -100,6 +108,11 @@ def schema_components(
         collapsed into a single type-array schema - e.g. ``int | None``
         renders as ``{"type": ["integer", "null"]}`` instead of an ``anyOf``.
         Defaults to False.
+    aliases : bool, optional
+        If True, named type aliases (a `typing.NewType` or a :pep:`695`
+        ``type X = ...``) become their own named components, referenced
+        wherever they're used. If False (the default) aliases are
+        transparently resolved to their underlying type and inlined.
 
     Returns
     -------
@@ -113,7 +126,7 @@ def schema_components(
     --------
     schema
     """
-    type_infos = mi.multi_type_info(types)
+    type_infos = mi.multi_type_info(types, aliases=aliases)
 
     component_types = _collect_component_types(type_infos)
 
@@ -139,7 +152,13 @@ def _collect_component_types(type_infos: Iterable[mi.Type]) -> dict[Any, mi.Type
     components = {}
 
     def collect(t):
-        if isinstance(t, mi.AbstractStructType):
+        if isinstance(t, mi.AliasType):
+            # Only present with `aliases=True` - a named alias becomes its
+            # own component, referencing (or inlining) its underlying type.
+            if t.cls not in components:
+                components[t.cls] = t
+                collect(t.value)
+        elif isinstance(t, mi.AbstractStructType):
             # An abstract struct is transparent - it behaves as the union of
             # its concrete descendants, so collect those instead.
             collect(t.concrete_union_type)
@@ -275,7 +294,11 @@ class _SchemaGenerator:
                 schema["$ref"] = self.ref_template.format(name=name)
                 return schema
 
-        if isinstance(t, mi.AbstractStructType):
+        if isinstance(t, mi.AliasType):
+            # Reached with check_ref=False when rendering the alias's own
+            # component definition - emit the underlying type's schema.
+            schema = mi._merge_json(schema, self.to_schema(t.value))
+        elif isinstance(t, mi.AbstractStructType):
             # An abstract struct renders as the tagged union of its concretes.
             schema = mi._merge_json(schema, self.to_schema(t.concrete_union_type))
         elif isinstance(t, (mi.AnyType, mi.RawType)):

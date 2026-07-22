@@ -1494,3 +1494,71 @@ class TestSimplifyUnions:
             (Union[int, None],), simplify_unions=True
         )
         assert out == {"type": ["integer", "null"]}
+
+
+class TestSchemaAliases:
+    """`aliases=True` names type aliases as $defs components."""
+
+    def test_pep695_aliases(self):
+        src = "\n".join(
+            [
+                "type Lit = Literal['a', 'b', 'c']",
+                "type Int = int",
+            ]
+        )
+        ns = {"Literal": Literal}
+        exec(src, ns)
+        Int, Lit = ns["Int"], ns["Lit"]
+
+        class Foo(msgspec.Struct):
+            bar: Int
+            bam: Lit
+
+        res = msgspec.json.schema(Foo, aliases=True)
+        props = res["$defs"]["Foo"]["properties"]
+        assert props == {
+            "bar": {"$ref": "#/$defs/Int"},
+            "bam": {"$ref": "#/$defs/Lit"},
+        }
+        assert res["$defs"]["Int"] == {"type": "integer"}
+        assert res["$defs"]["Lit"] == {"enum": ["a", "b", "c"]}
+
+    def test_newtype_alias(self):
+        UserId = NewType("UserId", int)
+        res = msgspec.json.schema(UserId, aliases=True)
+        assert res == {
+            "$ref": "#/$defs/UserId",
+            "$defs": {"UserId": {"type": "integer"}},
+        }
+
+    def test_default_off_inlines(self):
+        UserId = NewType("UserId", int)
+        assert msgspec.json.schema(UserId) == {"type": "integer"}
+
+    def test_generic_alias_specializations(self):
+        ns = {}
+        exec("type Vec[T] = list[T]", ns)
+        Vec = ns["Vec"]
+
+        class Foo(msgspec.Struct):
+            a: Vec[int]
+            b: Vec[str]
+
+        res = msgspec.json.schema(Foo, aliases=True)
+        props = res["$defs"]["Foo"]["properties"]
+        assert props["a"] == {"$ref": "#/$defs/Vec_int_"}
+        assert props["b"] == {"$ref": "#/$defs/Vec_str_"}
+        assert res["$defs"]["Vec_int_"] == {
+            "type": "array",
+            "items": {"type": "integer"},
+        }
+
+    def test_alias_of_struct_chains_refs(self):
+        class Point(msgspec.Struct):
+            x: int
+
+        Pt = NewType("Pt", Point)
+        res = msgspec.json.schema(Pt, aliases=True)
+        assert res["$ref"] == "#/$defs/Pt"
+        assert res["$defs"]["Pt"] == {"$ref": "#/$defs/Point"}
+        assert res["$defs"]["Point"]["type"] == "object"

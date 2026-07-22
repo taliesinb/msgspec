@@ -117,6 +117,7 @@ def schema(
     schema_hook: _SchemaHookSig = None,
     ref_template: str = "#/$defs/{name}",
     simplify_unions: bool = False,
+    aliases: bool = False,
 ) -> dict[str, Any]: ...
 def schema_components(
     types: Iterable[Any],
@@ -124,6 +125,7 @@ def schema_components(
     schema_hook: _SchemaHookSig = None,
     ref_template: str = "#/$defs/{name}",
     simplify_unions: bool = False,
+    aliases: bool = False,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]: ...
 @overload
 def format(buf: str, /, *, indent: int = 2) -> str: ...
