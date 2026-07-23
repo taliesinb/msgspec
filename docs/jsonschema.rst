@@ -108,9 +108,12 @@ type-array form wherever it is safe to do so:
     >>> msgspec.json.schema(int | None, simplify_unions=True)
     {'type': ['integer', 'null']}
 
-A union collapses when every member is a plain type-keyword schema and at most
-one member carries extra constraint keys (which are per-type in JSON Schema, so
-they transfer unambiguously):
+A union collapses when every member is a plain *scalar* type-keyword schema
+(``null``/``boolean``/``integer``/``number``/``string``) and at most one member
+carries extra constraint keys (which are per-type in JSON Schema, so they
+transfer unambiguously). Members with substructure - arrays and objects - are
+never folded in, so keywords like ``items`` can't end up attached to a merged
+type-array:
 
 .. code-block:: python
 
@@ -121,6 +124,17 @@ Unions containing ``$ref`` members (structs, enums), literals, or multiple
 constrained members fall back to ``anyOf`` unchanged. The two forms validate
 identically; the type-array form is simply more compact and is handled more
 gracefully by some schema consumers.
+
+
+Const tags
+----------
+
+Struct tag fields (and other fixed single values, like the ``"tensor"``
+marker in tensor schemas) render as ``{"const": <tag>}`` - the idiomatic
+modern form, equivalent to upstream msgspec's ``{"enum": [<tag>]}``. The
+output already relies on draft 2019-09+ constructs (``$defs``,
+``discriminator``), so ``const`` (draft 6) imposes no additional
+compatibility requirement.
 
 
 Named type aliases

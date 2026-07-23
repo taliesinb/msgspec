@@ -265,18 +265,26 @@ class _SchemaGenerator:
         self.ref_template = ref_template
         self.simplify_unions = simplify_unions
 
+    # Only schemas of these types may fold into a type-array: scalars have no
+    # substructure, so merging can't smear keywords like `items`/`properties`
+    # across branches. Containers (array/object) always stay in `anyOf`.
+    _MERGEABLE_TYPES = frozenset(
+        {"null", "boolean", "integer", "number", "string"}
+    )
+
     def _union_anyof(self, options: list[dict[str, Any]]) -> dict[str, Any]:
         """Render union member schemas, collapsing to a single type-array
         schema ({"type": ["integer", "null"], ...}) when ``simplify_unions``
-        is enabled and it's safe: every member must be a plain type-keyword
-        schema, and at most one may carry extra (per-type) constraint keys."""
+        is enabled and it's safe: every member must be a plain scalar
+        type-keyword schema, and at most one may carry extra (per-type)
+        constraint keys."""
         if self.simplify_unions and len(options) >= 2:
             types = []
             extra: dict[str, Any] = {}
             for opt in options:
                 tp = opt.get("type")
                 rest = {k: v for k, v in opt.items() if k != "type"}
-                if not isinstance(tp, str) or tp in types or (rest and extra):
+                if tp not in self._MERGEABLE_TYPES or tp in types or (rest and extra):
                     break
                 types.append(tp)
                 extra = extra or rest
@@ -470,7 +478,7 @@ class _SchemaGenerator:
             if t.tag_field is not None:
                 required.append(t.tag_field)
                 names.append(t.tag_field)
-                fields.append({"enum": [t.tag]})
+                fields.append({"const": t.tag})
 
             for field in t.fields:
                 field_schema = self.to_schema(field.type)
@@ -544,7 +552,7 @@ class _SchemaGenerator:
                 shape_schema = {
                     "type": "array",
                     "prefixItems": [
-                        {"type": "integer"} if s is None else {"enum": [s]}
+                        {"type": "integer"} if s is None else {"const": s}
                         for s in sizes
                     ],
                     "minItems": len(sizes),
@@ -552,10 +560,10 @@ class _SchemaGenerator:
                 }
             schema["type"] = "object"
             schema["properties"] = {
-                "type": {"enum": ["tensor"]},
+                "type": {"const": "tensor"},
                 "shape": shape_schema,
                 "dtype": (
-                    {"type": "string"} if dtype is None else {"enum": [dtype]}
+                    {"type": "string"} if dtype is None else {"const": dtype}
                 ),
                 "data": {"type": "string", "contentEncoding": "base64"},
             }

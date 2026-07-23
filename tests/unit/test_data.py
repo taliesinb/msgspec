@@ -642,8 +642,8 @@ class TestJsonSchema:
         schema = msgspec.json.schema(Model)
         prop = schema["$defs"]["Model"]["properties"]["weights"]
         assert prop["type"] == "object"
-        assert prop["properties"]["type"] == {"enum": ["tensor"]}
-        assert prop["properties"]["dtype"] == {"enum": ["float32"]}
+        assert prop["properties"]["type"] == {"const": "tensor"}
+        assert prop["properties"]["dtype"] == {"const": "float32"}
         assert prop["properties"]["shape"] == {
             "type": "array",
             "prefixItems": [{"type": "integer"}, {"type": "integer"}],
@@ -668,16 +668,16 @@ class TestJsonSchema:
 
         schema = msgspec.json.schema(Tensor[(2, 3), UInt8])
         assert schema["properties"]["shape"]["prefixItems"] == [
-            {"enum": [2]},
-            {"enum": [3]},
+            {"const": 2},
+            {"const": 3},
         ]
 
     def test_array_schema(self):
         from msgspec.data import Array, UInt8
 
         schema = msgspec.json.schema(Array[UInt8, 4])
-        assert schema["properties"]["dtype"] == {"enum": ["uint8"]}
-        assert schema["properties"]["shape"]["prefixItems"] == [{"enum": [4]}]
+        assert schema["properties"]["dtype"] == {"const": "uint8"}
+        assert schema["properties"]["shape"]["prefixItems"] == [{"const": 4}]
 
     def test_array_schema_unsized(self):
         from msgspec.data import Array, UInt8

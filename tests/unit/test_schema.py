@@ -440,7 +440,7 @@ def test_struct_object_tagged():
                 "title": "Point",
                 "type": "object",
                 "properties": {
-                    "type": {"enum": ["Point"]},
+                    "type": {"const": "Point"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                 },
@@ -462,7 +462,7 @@ def test_struct_array_tagged():
                 "title": "Point",
                 "type": "array",
                 "prefixItems": [
-                    {"enum": ["Point"]},
+                    {"const": "Point"},
                     {"type": "integer"},
                     {"type": "integer"},
                 ],
@@ -897,7 +897,7 @@ def test_struct_tagged_union():
         "$defs": {
             "Point": {
                 "properties": {
-                    "type": {"enum": ["Point"]},
+                    "type": {"const": "Point"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                 },
@@ -907,7 +907,7 @@ def test_struct_tagged_union():
             },
             "Point3D": {
                 "properties": {
-                    "type": {"enum": ["Point3D"]},
+                    "type": {"const": "Point3D"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                     "z": {"type": "integer"},
@@ -968,7 +968,7 @@ def test_struct_tagged_union_mixed_types():
         "$defs": {
             "Point": {
                 "properties": {
-                    "type": {"enum": ["Point"]},
+                    "type": {"const": "Point"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                 },
@@ -978,7 +978,7 @@ def test_struct_tagged_union_mixed_types():
             },
             "Point3D": {
                 "properties": {
-                    "type": {"enum": ["Point3D"]},
+                    "type": {"const": "Point3D"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                     "z": {"type": "integer"},
@@ -1039,7 +1039,7 @@ def test_struct_array_union():
             "Point": {
                 "minItems": 3,
                 "prefixItems": [
-                    {"enum": ["Point"]},
+                    {"const": "Point"},
                     {"type": "integer"},
                     {"type": "integer"},
                 ],
@@ -1049,7 +1049,7 @@ def test_struct_array_union():
             "Point3D": {
                 "minItems": 4,
                 "prefixItems": [
-                    {"enum": ["Point3D"]},
+                    {"const": "Point3D"},
                     {"type": "integer"},
                     {"type": "integer"},
                     {"type": "integer"},
@@ -1138,7 +1138,7 @@ def test_generic_struct_tagged_union():
         "$defs": {
             "Point_int_": {
                 "properties": {
-                    "type": {"enum": ["Point"]},
+                    "type": {"const": "Point"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                 },
@@ -1148,7 +1148,7 @@ def test_generic_struct_tagged_union():
             },
             "Point3D_int_": {
                 "properties": {
-                    "type": {"enum": ["Point3D"]},
+                    "type": {"const": "Point3D"},
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                     "z": {"type": "integer"},
@@ -1601,3 +1601,36 @@ class TestRecursiveAliases:
         out = msgspec.typescript.schema(JSON)
         assert "export type JSON =" in out
         assert "Array<JSON>" in out
+
+
+class TestConstTag:
+    """Struct tag fields render as {"const": tag}."""
+
+    def test_str_tag(self):
+        class Cat(msgspec.Struct, tag_field="kind", tag="cat"):
+            name: str
+
+        res = msgspec.json.schema(Cat)
+        assert res["$defs"]["Cat"]["properties"]["kind"] == {"const": "cat"}
+
+    def test_int_tag(self):
+        class Cat(msgspec.Struct, tag_field="kind", tag=3):
+            name: str
+
+        res = msgspec.json.schema(Cat)
+        assert res["$defs"]["Cat"]["properties"]["kind"] == {"const": 3}
+
+
+def test_simplify_unions_containers_not_merged():
+    # Members with substructure (array/object) never fold into a type-array;
+    # scalar members alone do.
+    typ = Union[str, List[str], None]
+    assert msgspec.json.schema(typ, simplify_unions=True) == {
+        "anyOf": [
+            {"type": "string"},
+            {"type": "array", "items": {"type": "string"}},
+            {"type": "null"},
+        ]
+    }
+    typ = Union[str, Dict[str, int], None]
+    assert "anyOf" in msgspec.json.schema(typ, simplify_unions=True)
