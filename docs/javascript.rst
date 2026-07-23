@@ -5,6 +5,8 @@ JavaScript
 msgspec-compatible :doc:`types <supported-types>` - a plain-JS counterpart to
 the :doc:`TypeScript codec <typescript>`. It is useful for sharing a schema
 between a Python backend and a JavaScript frontend.
+`msgspec.javascript.schema` generates matching JSDoc_-annotated type
+definitions (see `JSDoc schemas`_ below).
 
 The output is a dependency-free ES module that inlines its own tight MessagePack
 reader/writer and exports a ``msgpack`` and/or a ``json`` namespace (``{ encode,
@@ -89,6 +91,87 @@ Use it as:
     const value3 = json.decode(text);
 
 Pass ``msgpack=False`` or ``json=False`` to omit a namespace.
+
+
+JSDoc schemas
+-------------
+
+`msgspec.javascript.schema` (and `msgspec.javascript.schema_components`) is the
+plain-JavaScript counterpart to `msgspec.typescript.schema`: instead of
+TypeScript declarations it emits JSDoc_-annotated JavaScript - the standard way
+plain JS is typed, fully understood by editors and by ``tsc --checkJs``
+(the whole output type-checks under ``tsc --strict --checkJs``).
+
+Struct-like types (structs, dataclasses, typed-dicts, named-tuples) become real
+``class`` definitions: each field is declared with a ``@type`` annotation, and a
+destructuring constructor documents field defaults as executable JavaScript
+parameter defaults. Enums become frozen ``@enum`` objects; named aliases and
+:ref:`abstract structs <abstract>` become ``@typedef`` declarations.
+
+.. code-block:: python
+
+    import enum
+    import msgspec
+    from msgspec import Struct
+
+
+    class Fruit(enum.Enum):
+        APPLE = "apple"
+        BANANA = "banana"
+
+
+    class Product(Struct, tag="product"):
+        """A product in a catalog"""
+        id: int
+        name: str
+        tags: set[str] = set()
+        fruit: Fruit = Fruit.APPLE
+
+
+    print(msgspec.javascript.schema(Product))
+
+.. code-block:: javascript
+
+    /** A product in a catalog */
+    export class Product {
+      /** @type {"product"} */
+      type = "product";
+      /** @type {number} */
+      id;
+      /** @type {string} */
+      name;
+      /** @type {Set<string>} */
+      tags;
+      /** @type {Fruit} */
+      fruit;
+
+      /**
+       * @param {Object} fields
+       * @param {number} fields.id
+       * @param {string} fields.name
+       * @param {Set<string>} [fields.tags]
+       * @param {Fruit} [fields.fruit]
+       */
+      constructor({ id, name, tags = new Set(), fruit = Fruit.APPLE }) {
+        this.id = id;
+        this.name = name;
+        this.tags = tags;
+        this.fruit = fruit;
+      }
+    }
+
+    /** @enum {string} */
+    export const Fruit = Object.freeze({
+      APPLE: "apple",
+      BANANA: "banana",
+    });
+
+The type expressions inside ``{...}`` use TypeScript type syntax (which JSDoc
+accepts), so the two schema generators stay in lockstep. If the top-level type
+is not itself nameable (e.g. ``list[Product]``), a ``@typedef ... Root`` names
+it. The schema is independent of the codec: decoders still return plain
+objects, and the constructors are a convenience for user code (a constructed
+instance has exactly the codec's expected shape, tag field included).
 
 
 Tagged unions and abstract structs
@@ -176,4 +259,5 @@ directory; in an installed wheel, to the copy bundled inside the package.
 
 
 .. _JavaScript: https://developer.mozilla.org/en-US/docs/Web/JavaScript
+.. _JSDoc: https://jsdoc.app/
 .. _@msgpack/msgpack: https://github.com/msgpack/msgpack-javascript

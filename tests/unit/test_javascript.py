@@ -657,3 +657,252 @@ def test_node_elide_implied_tag_byte_compat(tmp_path):
     assert out["jroundtrips"] is True
     # and Python can decode the JS bytes
     assert msgspec.msgpack.decode(bytes.fromhex(out["hex"]), type=Doc) == value
+
+
+# --- schema ----------------------------------------------------------------
+
+
+def js(type):
+    return msgspec.javascript.schema(type)
+
+
+class TestSchema:
+    def test_struct_basic(self):
+        class Point(Struct):
+            x: int
+            y: int
+
+        out = js(Point)
+        assert "export class Point {" in out
+        assert "  /** @type {number} */\n  x;" in out
+        assert "  /** @type {number} */\n  y;" in out
+        assert "@param {Object} fields" in out
+        assert "@param {number} fields.x" in out
+        assert "constructor({ x, y }) {" in out
+        assert "this.x = x;" in out
+
+    def test_docstring_emitted_as_jsdoc(self):
+        class Point(Struct):
+            """A point in 2d."""
+
+            x: int
+
+        out = js(Point)
+        assert "/** A point in 2d. */\nexport class Point {" in out
+
+    def test_defaults_in_constructor(self):
+        class Config(Struct):
+            a: "int | None" = None
+            b: list = []
+            c: set = set()
+            d: dict = {}
+            flag: bool = True
+            name: str = "hi"
+
+        out = js(Config)
+        assert (
+            "constructor({ a = null, b = [], c = new Set(), d = {}, "
+            "flag = true, name = \"hi\" } = {}) {" in out
+        )
+        # all-optional: the fields object itself is optional
+        assert "@param {Object} [fields]" in out
+        assert "@param {number | null} [fields.a]" in out
+
+    def test_tag_field_initializer_not_constructor_param(self):
+        class Doc(Struct, tag="doc"):
+            body: str
+
+        out = js(Doc)
+        assert '  /** @type {"doc"} */\n  type = "doc";' in out
+        assert "constructor({ body }) {" in out
+        assert "fields.type" not in out
+
+    def test_enum(self):
+        class Fruit(enum.Enum):
+            """Some fruit."""
+
+            APPLE = "apple"
+            BANANA = "banana"
+
+        out = js(Fruit)
+        assert "@enum {string}" in out
+        assert "Some fruit." in out
+        assert "export const Fruit = Object.freeze({" in out
+        assert '  APPLE: "apple",' in out
+        assert "});" in out
+
+    def test_int_enum(self):
+        class Level(enum.IntEnum):
+            LOW = 1
+            HIGH = 2
+
+        out = js(Level)
+        assert "@enum {number}" in out
+        assert "  LOW: 1," in out
+
+    def test_enum_default_uses_member_access(self):
+        class Fruit(enum.Enum):
+            APPLE = "apple"
+
+        class Basket(Struct):
+            fruit: Fruit = Fruit.APPLE
+
+        out = js(Basket)
+        assert "fruit = Fruit.APPLE" in out
+
+    def test_abstract_struct_is_typedef(self):
+        class Animal(Struct, abstract=True, tag_field="kind"):
+            name: str
+
+        class Dog(Animal, tag="dog"):
+            pass
+
+        class Cat(Animal, tag="cat"):
+            pass
+
+        out = js(Animal)
+        assert "/** @typedef {Dog | Cat} Animal */" in out
+        assert "export class Dog {" in out
+        assert '  kind = "dog";' in out
+
+    def test_newtype_alias_is_typedef(self):
+        from typing import NewType
+
+        UserId = NewType("UserId", int)
+
+        class User(Struct):
+            id: UserId
+
+        out = js(User)
+        assert "/** @typedef {number} UserId */" in out
+        assert "  /** @type {UserId} */\n  id;" in out
+
+    def test_root_typedef_for_non_nameable(self):
+        class Point(Struct):
+            x: int
+
+        out = js(list[Point])
+        assert "/** @typedef {Array<Point>} Root */" in out
+
+    def test_reserved_word_field_renamed_binding(self):
+        class Weird(Struct):
+            default: "int | None" = None
+
+        out = js(Weird)
+        # `default` is fine as a property, but not as a bare binding.
+        assert "  /** @type {number | null} */\n  default;" in out
+        assert "constructor({ default: default_ = null } = {}) {" in out
+        assert "this.default = default_;" in out
+
+    def test_non_identifier_field_uses_inline_param_type(self):
+        class Weird(Struct):
+            odd_name: str = msgspec.field(default="hi", name="odd-name")
+
+        out = js(Weird)
+        # Dotted @param paths can't hold quoted names; falls back to an
+        # inline object type.
+        assert '@param {{ "odd-name"?: string }} [fields]' in out
+        assert 'constructor({ "odd-name": odd_name = "hi" } = {}) {' in out
+        assert 'this["odd-name"] = odd_name;' in out
+
+    def test_bigint_default_gets_n_suffix(self):
+        class Big(Struct):
+            n: Int64 = 5
+
+        out = js(Big)
+        assert "n = 5n" in out
+        assert "  /** @type {bigint} */\n  n;" in out
+
+    def test_schema_components_multiple(self):
+        class A(Struct):
+            x: int
+
+        class B(Struct):
+            a: A
+
+        refs, components = msgspec.javascript.schema_components([B, list[A]])
+        assert refs == ("B", "Array<A>")
+        assert set(components) == {"A", "B"}
+        assert "export class A {" in components["A"]
+
+    @needs_node
+    def test_node_constructs_and_serializes(self, tmp_path):
+        class Fruit(enum.Enum):
+            APPLE = "apple"
+            BANANA = "banana"
+
+        class Animal(Struct, abstract=True, tag_field="kind"):
+            name: str
+
+        class Dog(Animal, tag="dog"):
+            barks: bool = True
+
+        class Cat(Animal, tag="cat"):
+            lives: int = 9
+
+        class Config(Struct):
+            pet: Union[Animal, None] = None
+            fruit: Fruit = Fruit.BANANA
+            tags: list = []
+
+        src = js(Config)
+        driver = """
+        const c = new Config({ pet: new Dog({ name: "rex" }) });
+        console.log(JSON.stringify(c));
+        """
+        path = tmp_path / "schema.mjs"
+        path.write_text(src + driver)
+        out = subprocess.run(
+            [NODE, str(path)], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        assert json.loads(out) == {
+            "pet": {"kind": "dog", "name": "rex", "barks": True},
+            "fruit": "banana",
+            "tags": [],
+        }
+
+    @pytest.mark.skipif(
+        shutil.which("tsc") is None, reason="tsc not installed"
+    )
+    def test_tsc_strict_checkjs(self, tmp_path):
+        class Fruit(enum.Enum):
+            APPLE = "apple"
+
+        class Animal(Struct, abstract=True, tag_field="kind"):
+            name: str
+
+        class Dog(Animal, tag="dog"):
+            barks: bool = True
+
+        class Weird(Struct):
+            default: "int | None" = None
+            odd_name: str = msgspec.field(default="hi", name="odd-name")
+
+        class Config(Struct):
+            pet: Union[Animal, None] = None
+            fruit: Fruit = Fruit.APPLE
+            w: Union[Weird, None] = None
+
+        src = js(Config)
+        use = """
+        const c = new Config({ pet: new Dog({ name: "rex" }) });
+        const w = new Weird({ "odd-name": "x" });
+        console.log(JSON.stringify(c), w.default);
+        """
+        path = tmp_path / "schema.mjs"
+        path.write_text(src + use)
+        res = subprocess.run(
+            [
+                shutil.which("tsc"),
+                "--allowJs",
+                "--checkJs",
+                "--noEmit",
+                "--strict",
+                "--target",
+                "es2022",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr

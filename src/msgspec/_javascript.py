@@ -9,27 +9,38 @@ identical to `msgspec.msgpack`.
 Unlike the TypeScript codec, this targets plain JavaScript: there are no type
 annotations, and 64-bit integer types (``Int``/``Int64``/``UInt64``) round-trip
 as native ``bigint`` with no safe-integer narrowing.
+
+`msgspec.javascript.schema` is the plain-JS counterpart to
+`msgspec.typescript.schema`: JSDoc-annotated class/enum/typedef definitions
+(valid under ``tsc --strict --checkJs``) with destructuring constructors whose
+parameter defaults document the fields' default values.
 """
 
 from __future__ import annotations
 
+import enum
+import re
 import textwrap
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from . import inspect as mi
+from . import inspect as mi, to_builtins
 from ._msgpack_runtime_js import RUNTIME as _MSGPACK_RUNTIME
 from ._typescript import (
+    _IDENT_RE,
     _build_name_map,
+    _collect_component_types as _collect_schema_component_types,
     _contains_tensor,
+    _get_doc,
     _literal_value,
     _prop_name,
+    _SchemaGenerator as _TsSchemaGenerator,
     _str,
     _str_inner,
 )
 
-__all__ = ("codec", "bundle_path")
+__all__ = ("schema", "schema_components", "codec", "bundle_path")
 
 _INDENT = "  "
 
@@ -965,3 +976,314 @@ def codec(
         )
 
     return "\n\n".join(parts) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# JSDoc schema generation
+# ---------------------------------------------------------------------------
+
+# Words that can't be used as a plain destructuring binding in strict-mode JS.
+_JS_RESERVED = frozenset(
+    """
+    arguments await break case catch class const continue debugger default
+    delete do else enum eval export extends false finally for function if
+    implements import in instanceof interface let new null package private
+    protected public return static super switch this throw true try typeof
+    var void while with yield
+    """.split()
+)
+
+
+def _jsdoc_block(lines: list[str], indent: str = "") -> str:
+    if len(lines) == 1:
+        return f"{indent}/** {lines[0]} */"
+    body = "\n".join(f"{indent} * {line}".rstrip() for line in lines)
+    return f"{indent}/**\n{body}\n{indent} */"
+
+
+def _binding_name(name: str, used: set[str]) -> str:
+    """A valid, unused JS binding name for destructuring field `name`."""
+    out = re.sub(r"[^A-Za-z0-9_$]", "_", name) or "_"
+    if out[0].isdigit():
+        out = "_" + out
+    while out in _JS_RESERVED or out in used:
+        out += "_"
+    used.add(out)
+    return out
+
+
+def _builtin_literal(value: Any) -> str | None:
+    """Render a `to_builtins` output value as a JS literal, or None if it
+    has no clean literal form."""
+    if value is None or isinstance(value, (bool, str)):
+        return _literal_value(value)
+    if isinstance(value, int):
+        return repr(value)
+    if isinstance(value, float):
+        if value != value:
+            return "NaN"
+        if value == float("inf"):
+            return "Infinity"
+        if value == float("-inf"):
+            return "-Infinity"
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        items = [_builtin_literal(v) for v in value]
+        if any(i is None for i in items):
+            return None
+        return "[" + ", ".join(items) + "]"
+    if isinstance(value, dict):
+        parts = []
+        for k, v in value.items():
+            if not isinstance(k, str):
+                return None
+            vl = _builtin_literal(v)
+            if vl is None:
+                return None
+            parts.append(f"{_prop_name(k)}: {vl}")
+        return "{ " + ", ".join(parts) + " }" if parts else "{}"
+    return None
+
+
+def _default_literal(value: Any) -> str | None:
+    """Render a Python default value as a JS literal matching the value's
+    JSON wire form (sets excepted, which stay `Set`s in JS)."""
+    if isinstance(value, (set, frozenset)):
+        items = [_default_literal(v) for v in sorted(value, key=repr)]
+        if any(i is None for i in items):
+            return None
+        return f"new Set([{', '.join(items)}])" if items else "new Set()"
+    try:
+        value = to_builtins(value, str_keys=True)
+    except (TypeError, ValueError):
+        return None
+    return _builtin_literal(value)
+
+
+def _field_default_literal(f: mi.Field) -> str | None:
+    if f.default is not mi.NODEFAULT:
+        out = _default_literal(f.default)
+        if (
+            out is not None
+            and isinstance(f.default, int)
+            and not isinstance(f.default, bool)
+            and _is_bigint(_unwrap(f.type))
+        ):
+            out += "n"
+        return out
+    factory = f.default_factory
+    if factory is not mi.NODEFAULT:
+        if factory in (list, tuple):
+            return "[]"
+        if factory is dict:
+            return "{}"
+        if factory in (set, frozenset):
+            return "new Set()"
+        if factory in (bytes, bytearray):
+            return '""'
+    return None
+
+
+class _JsSchemaGenerator(_TsSchemaGenerator):
+    """Renders the same type language as the TypeScript schema generator
+    (`to_ref` is inherited - JSDoc type expressions accept TypeScript type
+    syntax), but emits JSDoc-annotated plain-JavaScript definitions instead
+    of TypeScript declarations."""
+
+    def to_def(self, name: str, t: mi.Type) -> str:
+        if isinstance(t, mi.AbstractStructType):
+            # A named alias for the tagged union of its concrete descendants.
+            return self._typedef(name, t.concrete_union_type)
+        elif isinstance(t, mi.AliasType):
+            return self._typedef(name, t.value)
+        elif isinstance(t, mi.EnumType):
+            return self._enum_def(name, t)
+        else:
+            # Struct, TypedDict, Dataclass, NamedTuple
+            return self._object_def(name, t)
+
+    def _typedef(self, name: str, t: mi.Type) -> str:
+        return _jsdoc_block([f"@typedef {{{self.to_ref(t)}}} {name}"])
+
+    def _enum_def(self, name: str, t: mi.EnumType) -> str:
+        values = [m.value for m in t.cls]
+        if all(isinstance(v, str) for v in values):
+            etype = "string"
+        elif all(isinstance(v, (int, float)) for v in values):
+            etype = "number"
+        else:
+            etype = "string | number"
+        doc_lines = []
+        if doc := _get_doc(t):
+            doc_lines.extend(doc.splitlines())
+        doc_lines.append(f"@enum {{{etype}}}")
+        lines = [_jsdoc_block(doc_lines)]
+        lines.append(f"export const {name} = Object.freeze({{")
+        for member in t.cls:
+            lines.append(
+                f"{_INDENT}{_prop_name(member.name)}: {_literal_value(member.value)},"
+            )
+        lines.append("});")
+        return "\n".join(lines)
+
+    def _object_def(self, name: str, t: mi.Type) -> str:
+        tagged = isinstance(t, mi.StructType) and t.tag_field is not None
+        lines = []
+        if doc := _get_doc(t):
+            lines.append(_jsdoc_block(doc.splitlines()))
+        lines.append(f"export class {name} {{")
+        if tagged:
+            lines.append(f"{_INDENT}/** @type {{{_literal_value(t.tag)}}} */")
+            lines.append(
+                f"{_INDENT}{_prop_name(t.tag_field)} = {_literal_value(t.tag)};"
+            )
+        for f in t.fields:
+            lines.append(f"{_INDENT}/** @type {{{self.to_ref(f.type)}}} */")
+            lines.append(f"{_INDENT}{_prop_name(f.encode_name)};")
+        if t.fields:
+            lines.append("")
+            lines.extend(self._constructor_lines(t))
+        lines.append("}")
+        return "\n".join(lines)
+
+    def _field_default(self, f: mi.Field) -> str | None:
+        # An enum-member default whose enum is a named component renders as a
+        # member access (`Fruit.APPLE`) rather than the raw value.
+        if isinstance(f.default, enum.Enum):
+            if name := self.name_map.get(type(f.default)):
+                member = f.default.name
+                if _IDENT_RE.match(member):
+                    return f"{name}.{member}"
+                return f"{name}[{_prop_name(member)}]"
+        return _field_default_literal(f)
+
+    def _constructor_lines(self, t: mi.Type) -> list[str]:
+        all_optional = all(not f.required for f in t.fields)
+        param = "[fields]" if all_optional else "fields"
+        # The usual JSDoc idiom is one dotted `@param` per field, but `tsc`
+        # only accepts identifiers in dotted paths - if any field name needs
+        # quoting, fall back to a single inline object type (where quoted
+        # keys are valid).
+        if all(_IDENT_RE.match(f.encode_name) for f in t.fields):
+            doc = [f"@param {{Object}} {param}"]
+            for f in t.fields:
+                ref = self.to_ref(f.type)
+                fname = f"fields.{f.encode_name}"
+                doc.append(
+                    f"@param {{{ref}}} {fname}"
+                    if f.required
+                    else f"@param {{{ref}}} [{fname}]"
+                )
+        else:
+            props = ", ".join(
+                f"{_prop_name(f.encode_name)}{'' if f.required else '?'}: "
+                f"{self.to_ref(f.type)}"
+                for f in t.fields
+            )
+            doc = [f"@param {{{{ {props} }}}} {param}"]
+        entries = []
+        assigns = []
+        used: set[str] = set()
+        for f in t.fields:
+            binding = _binding_name(f.encode_name, used)
+            entry = (
+                binding
+                if binding == f.encode_name
+                else f"{_prop_name(f.encode_name)}: {binding}"
+            )
+            if not f.required and (default := self._field_default(f)) is not None:
+                entry += f" = {default}"
+            entries.append(entry)
+            if _IDENT_RE.match(f.encode_name):
+                assigns.append(f"this.{f.encode_name} = {binding};")
+            else:
+                assigns.append(f"this[{_prop_name(f.encode_name)}] = {binding};")
+        params = "{ " + ", ".join(entries) + " }"
+        if all_optional:
+            params += " = {}"
+        out = [_jsdoc_block(doc, indent=_INDENT)]
+        out.append(f"{_INDENT}constructor({params}) {{")
+        out.extend(f"{_INDENT}{_INDENT}{a}" for a in assigns)
+        out.append(f"{_INDENT}}}")
+        return out
+
+
+def schema(type: Any) -> str:
+    """Generate JSDoc-annotated JavaScript definitions for a given type.
+
+    The output is plain JavaScript documented in the standard JSDoc idiom
+    (fully understood by editors and ``tsc --checkJs``): struct-like types
+    (structs, dataclasses, typed-dicts, named-tuples) become ``class``
+    definitions with ``@type``-annotated fields and a destructuring
+    constructor whose parameter defaults document the fields' default values;
+    enums become frozen ``@enum`` objects; named aliases and abstract structs
+    become ``@typedef`` declarations. If the top-level ``type`` is not itself
+    a nameable type (for example ``list[Point]``), a ``@typedef ... Root`` is
+    emitted to name it.
+
+    Parameters
+    ----------
+    type : type
+        The type to generate JavaScript definitions for.
+
+    Returns
+    -------
+    schema : str
+        The generated JavaScript source.
+
+    See Also
+    --------
+    schema_components
+    msgspec.typescript.schema
+    """
+    (root,), components = schema_components((type,))
+
+    parts = list(components.values())
+    # If the root type isn't a nameable component it won't already appear in
+    # `components`; emit a typedef so the returned source names it.
+    if root not in components:
+        parts.append(f"/** @typedef {{{root}}} Root */")
+    return "\n\n".join(parts) + "\n"
+
+
+def schema_components(
+    types: Iterable[Any],
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Generate JSDoc-annotated JavaScript definitions for one or more types.
+
+    Parameters
+    ----------
+    types : Iterable[type]
+        An iterable of one or more types to generate definitions for.
+
+    Returns
+    -------
+    refs : tuple[str, ...]
+        A tuple of JSDoc type *references* (e.g. ``"Point"`` or
+        ``"Array<Point>"``), one for each type in ``types``.
+    components : dict[str, str]
+        A mapping of name to the JavaScript source defining each nameable
+        component referenced by ``refs``.
+
+    See Also
+    --------
+    schema
+    msgspec.typescript.schema_components
+    """
+    # `aliases=True` so `type Pixels = int` is preserved as an `AliasType` and
+    # emitted as a `@typedef` rather than being inlined.
+    type_infos = mi.multi_type_info(types, aliases=True)
+
+    component_types = _collect_schema_component_types(type_infos)
+
+    name_map = _build_name_map(component_types)
+
+    gen = _JsSchemaGenerator(name_map)
+
+    refs = tuple(gen.to_ref(t) for t in type_infos)
+
+    components = {
+        name_map[cls]: gen.to_def(name_map[cls], t)
+        for cls, t in component_types.items()
+    }
+    return refs, components
