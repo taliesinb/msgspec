@@ -3102,6 +3102,7 @@ typedef struct {
     PyObject *abstract_config;      /* bool or callable[str]->bool, inherited; or NULL */
     PyObject *abstract_parents;     /* list[type] of abstract ancestors, or NULL */
     PyObject *concrete_children;    /* list[type] of concrete descendants (abstract only), or NULL */
+    PyObject *js_constructor;       /* str (signature) or None (no constructor), inherited; or NULL if unset */
 } StructMetaObject;
 
 typedef struct StructInfo {
@@ -5926,6 +5927,7 @@ typedef struct {
     PyObject *temp_tag;
     PyObject *temp_abstract;  /* borrowed: kwarg or inherited config (bool/callable) */
     int abstract;             /* resolved 0/1, or -1 if unset */
+    PyObject *js_constructor; /* borrowed: str/None kwarg or inherited value; or NULL */
     PyObject *rename;
     int omit_defaults;
     int forbid_unknown_fields;
@@ -6022,6 +6024,9 @@ structmeta_collect_base(StructMetaInfo *info, MsgspecState *mod, PyObject *base)
     }
     if (st_type->rename != NULL) {
         info->rename = st_type->rename;
+    }
+    if (st_type->js_constructor != NULL) {
+        info->js_constructor = st_type->js_constructor;
     }
     /* Inherit abstract config from the base unless explicitly set on this
      * class. Only a *callable* config is inherited (and re-evaluated per
@@ -6732,7 +6737,7 @@ StructMeta_new_inner(
     int arg_frozen, int arg_eq, int arg_order, bool arg_kw_only,
     int arg_repr_omit_defaults, int arg_array_like,
     int arg_gc, int arg_weakref, int arg_dict, int arg_cache_hash,
-    PyObject *arg_abstract
+    PyObject *arg_abstract, PyObject *arg_js_constructor
 ) {
     StructMetaObject *cls = NULL;
     MsgspecState *mod = msgspec_get_global_state();
@@ -6763,6 +6768,7 @@ StructMeta_new_inner(
         .temp_tag = NULL,
         .temp_abstract = NULL,
         .abstract = -1,
+        .js_constructor = NULL,
         .rename = NULL,
         .omit_defaults = -1,
         .forbid_unknown_fields = -1,
@@ -6818,6 +6824,18 @@ StructMeta_new_inner(
     info.gc = STRUCT_MERGE_OPTIONS(info.gc, arg_gc);
     info.omit_defaults = STRUCT_MERGE_OPTIONS(info.omit_defaults, arg_omit_defaults);
     info.forbid_unknown_fields = STRUCT_MERGE_OPTIONS(info.forbid_unknown_fields, arg_forbid_unknown_fields);
+
+    /* An explicit `js_constructor=` (a signature string, or None for "no
+     * constructor") overrides any inherited value. */
+    if (arg_js_constructor != NULL) {
+        if (arg_js_constructor != Py_None && !PyUnicode_Check(arg_js_constructor)) {
+            PyErr_SetString(
+                PyExc_TypeError, "Struct `js_constructor` must be a str or None"
+            );
+            goto cleanup;
+        }
+        info.js_constructor = arg_js_constructor;
+    }
 
     /* Resolve the abstract config (a bool or callable[str]->bool). An explicit
      * `abstract=` on this class overrides any inherited config; a callable is
@@ -6971,6 +6989,9 @@ StructMeta_new_inner(
     cls->omit_defaults = info.omit_defaults;
     cls->forbid_unknown_fields = info.forbid_unknown_fields;
 
+    Py_XINCREF(info.js_constructor);
+    cls->js_constructor = info.js_constructor;
+
     /* Abstract config */
     cls->abstract = info.abstract;
     Py_XINCREF(info.temp_abstract);
@@ -7033,7 +7054,7 @@ StructMeta_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
     int arg_frozen = -1, arg_eq = -1, arg_order = -1, arg_repr_omit_defaults = -1;
     int arg_array_like = -1, arg_gc = -1, arg_weakref = -1, arg_dict = -1;
     int arg_kw_only = 0, arg_cache_hash = -1;
-    PyObject *arg_abstract = NULL;
+    PyObject *arg_abstract = NULL, *arg_js_constructor = NULL;
 
     char *kwlist[] = {
         "name", "bases", "dict",
@@ -7042,20 +7063,20 @@ StructMeta_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
         "frozen", "eq", "order", "kw_only",
         "repr_omit_defaults", "array_like",
         "gc", "weakref", "dict", "cache_hash",
-        "abstract",
+        "abstract", "js_constructor",
         NULL
     };
 
     /* Parse arguments: (name, bases, dict) */
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "UO!O!|$OOOppppppppppppO:StructMeta.__new__", kwlist,
+            args, kwargs, "UO!O!|$OOOppppppppppppOO:StructMeta.__new__", kwlist,
             &name, &PyTuple_Type, &bases, &PyDict_Type, &namespace,
             &arg_tag_field, &arg_tag, &arg_rename,
             &arg_omit_defaults, &arg_forbid_unknown_fields,
             &arg_frozen, &arg_eq, &arg_order, &arg_kw_only,
             &arg_repr_omit_defaults, &arg_array_like,
             &arg_gc, &arg_weakref, &arg_dict, &arg_cache_hash,
-            &arg_abstract
+            &arg_abstract, &arg_js_constructor
         )
     )
         return NULL;
@@ -7067,7 +7088,7 @@ StructMeta_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
         arg_frozen, arg_eq, arg_order, arg_kw_only,
         arg_repr_omit_defaults, arg_array_like,
         arg_gc, arg_weakref, arg_dict, arg_cache_hash,
-        arg_abstract
+        arg_abstract, arg_js_constructor
     );
 }
 
@@ -7131,7 +7152,7 @@ msgspec_defstruct(PyObject *self, PyObject *args, PyObject *kwargs)
     int arg_frozen = -1, arg_eq = -1, arg_order = -1, arg_kw_only = 0;
     int arg_repr_omit_defaults = -1, arg_array_like = -1;
     int arg_gc = -1, arg_weakref = -1, arg_dict = -1, arg_cache_hash = -1;
-    PyObject *arg_abstract = NULL;
+    PyObject *arg_abstract = NULL, *arg_js_constructor = NULL;
 
     char *kwlist[] = {
         "name", "fields", "bases", "module", "namespace",
@@ -7140,20 +7161,20 @@ msgspec_defstruct(PyObject *self, PyObject *args, PyObject *kwargs)
         "frozen", "eq", "order", "kw_only",
         "repr_omit_defaults", "array_like",
         "gc", "weakref", "dict", "cache_hash",
-        "abstract",
+        "abstract", "js_constructor",
         NULL
     };
 
     /* Parse arguments: (name, bases, dict) */
     if (!PyArg_ParseTupleAndKeywords(
-            args, kwargs, "UO|$OOOOOOppppppppppppO:defstruct", kwlist,
+            args, kwargs, "UO|$OOOOOOppppppppppppOO:defstruct", kwlist,
             &name, &fields, &bases, &module, &namespace,
             &arg_tag_field, &arg_tag, &arg_rename,
             &arg_omit_defaults, &arg_forbid_unknown_fields,
             &arg_frozen, &arg_eq, &arg_order, &arg_kw_only,
             &arg_repr_omit_defaults, &arg_array_like,
             &arg_gc, &arg_weakref, &arg_dict, &arg_cache_hash,
-            &arg_abstract)
+            &arg_abstract, &arg_js_constructor)
     )
         return NULL;
 
@@ -7242,7 +7263,7 @@ msgspec_defstruct(PyObject *self, PyObject *args, PyObject *kwargs)
         arg_frozen, arg_eq, arg_order, arg_kw_only,
         arg_repr_omit_defaults, arg_array_like,
         arg_gc, arg_weakref, arg_dict, arg_cache_hash,
-        arg_abstract
+        arg_abstract, arg_js_constructor
     );
 
 cleanup:
@@ -7435,6 +7456,7 @@ StructMeta_traverse(StructMetaObject *self, visitproc visit, void *arg)
     Py_VISIT(self->abstract_config);  /* May be a function */
     Py_VISIT(self->abstract_parents);
     Py_VISIT(self->concrete_children);
+    Py_VISIT(self->js_constructor);
     return PyType_Type.tp_traverse((PyObject *)self, visit, arg);
 }
 
@@ -7457,6 +7479,7 @@ StructMeta_clear(StructMetaObject *self)
     Py_CLEAR(self->abstract_config);
     Py_CLEAR(self->abstract_parents);
     Py_CLEAR(self->concrete_children);
+    Py_CLEAR(self->js_constructor);
     if (self->struct_offsets != NULL) {
         PyMem_Free(self->struct_offsets);
         self->struct_offsets = NULL;
@@ -7686,6 +7709,16 @@ StructConfig_abstract_parents(StructConfig *self, void *closure)
 }
 
 static PyObject*
+StructConfig_js_constructor(StructConfig *self, void *closure)
+{
+    /* str (a signature) or None (no constructor); UNSET when never set. */
+    PyObject *out = self->st_type->js_constructor;
+    if (out == NULL) out = UNSET;
+    Py_INCREF(out);
+    return out;
+}
+
+static PyObject*
 StructConfig_concrete_children(StructConfig *self, void *closure)
 {
     PyObject *out = self->st_type->concrete_children;
@@ -7710,6 +7743,7 @@ static PyGetSetDef StructConfig_getset[] = {
     {"abstract", (getter) StructConfig_abstract, NULL, NULL, NULL},
     {"abstract_parents", (getter) StructConfig_abstract_parents, NULL, NULL, NULL},
     {"concrete_children", (getter) StructConfig_concrete_children, NULL, NULL, NULL},
+    {"js_constructor", (getter) StructConfig_js_constructor, NULL, NULL, NULL},
     {NULL},
 };
 

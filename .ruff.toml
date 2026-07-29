@@ -23,6 +23,8 @@ ignore = [
 "src/msgspec/__init__.py" = ["E402", "F401"]
 "src/msgspec/__init__.pyi" = ["F401"]
 "src/msgspec/json.py" = ["F401"]
+# Compact one-line `case` clauses are intentional in the signature parser.
+"src/msgspec/_typescript_constructors.py" = ["E701"]
 "src/msgspec/msgpack.py" = ["F401"]
 
 [lint.isort]

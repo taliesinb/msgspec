@@ -906,3 +906,237 @@ class TestSchema:
             text=True,
         )
         assert res.returncode == 0, res.stdout + res.stderr
+
+
+class TestSchemaConstructorsSpec:
+    def test_split(self):
+        class Point(Struct):
+            x: int
+            label: str = "origin"
+
+        out = msgspec.javascript.schema(Point, constructors="(*, **)")
+        assert "@param {number} x" in out
+        assert "@param {Object} [opts]" in out
+        assert "@param {string} [opts.label]" in out
+        assert 'constructor(x, { label = "origin" } = {}) {' in out
+
+    def test_split_no_optionals_is_positional(self):
+        class Point(Struct):
+            x: int
+            y: int
+
+        out = msgspec.javascript.schema(Point, constructors="(*, **)")
+        assert "constructor(x, y) {" in out
+
+    def test_positional(self):
+        class Point(Struct):
+            x: int
+            label: str = "origin"
+
+        out = msgspec.javascript.schema(Point, constructors="(*)")
+        assert "@param {number} x" in out
+        assert "@param {string} [label]" in out
+        assert 'constructor(x, label = "origin") {' in out
+
+    def test_positional_reserved_word_binding(self):
+        class Weird(Struct):
+            default: "int | None" = None
+
+        out = msgspec.javascript.schema(Weird, constructors="(*)")
+        assert "@param {number | null} [default_]" in out
+        assert "constructor(default_ = null) {" in out
+        assert "this.default = default_;" in out
+
+    def test_none_emits_typedef(self):
+        class Rec(Struct, tag="rec"):
+            """A record."""
+
+            a: int
+            b: str = "x"
+
+        out = msgspec.javascript.schema(Rec, constructors=None)
+        assert "class" not in out
+        assert "A record." in out
+        assert "@typedef {Object} Rec" in out
+        assert '@property {"rec"} type' in out
+        assert "@property {number} a" in out
+        assert "@property {string} [b]" in out
+
+    def test_none_quoted_name_inline_typedef(self):
+        class Weird(Struct):
+            odd_name: str = msgspec.field(default="hi", name="odd-name")
+
+        out = msgspec.javascript.schema(Weird, constructors=None)
+        assert '@typedef {{ "odd-name"?: string }} Weird' in out
+
+    def test_rest_param(self):
+        class Path(Struct):
+            name: str
+            points: list = []
+
+        out = msgspec.javascript.schema(Path, constructors="(name, ...points)")
+        assert "constructor(name, ...points) {" in out
+        assert "this.points = points;" in out
+
+    def test_renamed_object_key(self):
+        class Point(Struct):
+            x: int
+
+        out = msgspec.javascript.schema(Point, constructors="{X: x}")
+        assert "@param {Object} fields" in out
+        assert "@param {number} fields.X" in out
+        assert "constructor({ X: x }) {" in out
+        assert "this.x = x;" in out
+
+    def test_nested_seq_pattern(self):
+        class Point(Struct):
+            x: int
+            y: int
+
+        out = msgspec.javascript.schema(Point, constructors="([x, y])")
+        assert "@param {[number, number]} fields" in out
+        assert "constructor([x, y]) {" in out
+
+    def test_js_constructor_class_kwarg(self):
+        class Point(Struct, js_constructor="(*)"):
+            x: int
+            label: str = "origin"
+
+        out = msgspec.javascript.schema(Point)
+        assert 'constructor(x, label = "origin") {' in out
+
+    def test_invalid_spec_raises(self):
+        with pytest.raises(SyntaxError):
+            msgspec.javascript.schema(int, constructors="bogus")
+
+    @pytest.mark.skipif(shutil.which("tsc") is None, reason="tsc not installed")
+    @pytest.mark.parametrize(
+        "mode", ["{**}", "(*, **)", "(*)", "(dog, *, **)", "(*, ...tags)", None]
+    )
+    def test_tsc_strict_checkjs_all_modes(self, mode, tmp_path):
+        class Fruit(enum.Enum):
+            APPLE = "apple"
+
+        class Dog(Struct, tag="dog"):
+            name: str
+            barks: bool = True
+
+        # Field-specific signatures apply to Config via its class kwarg;
+        # Dog keeps the default spec.
+        class Config(Struct, js_constructor=mode):
+            dog: Dog
+            fruit: Fruit = Fruit.APPLE
+            tags: list = []
+
+        src = msgspec.javascript.schema(
+            Config, constructors=None if mode is None else "{**}"
+        )
+        if mode is not None:
+            dog = 'new Dog({ name: "rex" })'
+            call = {
+                "{**}": "new Config({ dog: d })",
+                "(*, **)": "new Config(d)",
+                "(*)": "new Config(d)",
+                "(dog, *, **)": "new Config(d)",
+                "(*, ...tags)": 'new Config(d, Fruit.APPLE, "a", "b")',
+            }[mode]
+            src += """
+        const d = %s;
+        const c = %s;
+        console.log(JSON.stringify(c), JSON.stringify(d));
+        """ % (dog, call)
+        path = tmp_path / "schema.mjs"
+        path.write_text(src)
+        res = subprocess.run(
+            [
+                shutil.which("tsc"),
+                "--allowJs",
+                "--checkJs",
+                "--noEmit",
+                "--strict",
+                "--target",
+                "es2022",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+
+    def test_per_class_kwargs_mix(self):
+        class A(Struct, js_constructor=None):
+            x: int
+
+        class B(Struct, js_constructor="(*, **)"):
+            a: A
+            n: int = 0
+
+        out = msgspec.javascript.schema(B)
+        # B: split constructor; A: typedef only (no class).
+        assert "constructor(a, { n = 0 } = {}) {" in out
+        assert "@typedef {Object} A" in out
+        assert "export class A" not in out
+
+    def test_mk_static_factory(self):
+        class Point(Struct):
+            x: int
+
+        out = msgspec.javascript.schema(Point)
+        assert "static mk(fields) {" in out
+        assert (
+            "return Object.assign("
+            "Object.create(Point.prototype), fields);" in out
+        )
+
+    def test_codec_uses_class_for_js_constructor_structs(self):
+        class Plain(Struct):
+            n: int
+
+        class Point(Struct, js_constructor="(*)"):
+            x: int
+            p: Plain
+
+        out = msgspec.javascript.codec(Point)
+        # Point gains its schema class and decodes to real instances...
+        assert "export class Point" in out
+        assert "constructor(x, p) {" in out
+        assert "return Point.mk(o);" in out
+        # ...while kwarg-less structs stay plain (documented as a typedef).
+        assert "@typedef {Object} Plain" in out
+        assert "Plain.mk" not in out
+
+    @needs_node
+    def test_codec_classes_decode_instances(self, tmp_path):
+        class Point(Struct, js_constructor="(x, y)"):
+            x: int
+            y: int
+
+        class Doc(Struct):
+            pts: list[Point]
+
+        src = msgspec.javascript.codec(Doc, classes=True)
+        driver = """
+        import { msgpack, json, Doc, Point } from "./codec.mjs";
+        const d = new Doc({ pts: [new Point(1, 2), Point.mk({ x: 3, y: 4 })] });
+        const b = msgpack.decode(msgpack.encode(d));
+        const j = json.decode(json.encode(d));
+        console.log(JSON.stringify({
+          mp: b instanceof Doc && b.pts[0] instanceof Point,
+          js: j instanceof Doc && j.pts[1] instanceof Point,
+          val: JSON.stringify(b) === JSON.stringify(d),
+        }));
+        """
+        out = json.loads(_run_node(src, driver, tmp_path))
+        assert out == {"mp": True, "js": True, "val": True}
+
+    def test_codec_classes_flag(self):
+        class Point(Struct):
+            x: int
+
+        out = msgspec.javascript.codec(Point, classes=True)
+        assert "export class Point" in out
+        assert "return Point.mk(o);" in out
+
+        out = msgspec.javascript.codec(Point, classes=False)
+        assert "export class Point" not in out
+        assert "Point.mk" not in out

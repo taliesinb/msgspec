@@ -158,6 +158,14 @@ parameter defaults. Enums become frozen ``@enum`` objects; named aliases and
         this.tags = tags;
         this.fruit = fruit;
       }
+
+      /**
+       * @param {Product} fields
+       * @returns {Product}
+       */
+      static mk(fields) {
+        return Object.assign(Object.create(Product.prototype), fields);
+      }
     }
 
     /** @enum {string} */
@@ -169,9 +177,30 @@ parameter defaults. Enums become frozen ``@enum`` objects; named aliases and
 The type expressions inside ``{...}`` use TypeScript type syntax (which JSDoc
 accepts), so the two schema generators stay in lockstep. If the top-level type
 is not itself nameable (e.g. ``list[Product]``), a ``@typedef ... Root`` names
-it. The schema is independent of the codec: decoders still return plain
+it. Every class also gets a ``static mk(fields)`` factory - the JS analog of
+Python's ``__new__`` - building an instance from a plain all-fields object
+without going through the constructor signature.
+
+By default the codec is independent of the schema: decoders return plain
 objects, and the constructors are a convenience for user code (a constructed
-instance has exactly the codec's expected shape, tag field included).
+instance has exactly the codec's expected shape, tag field included). But a
+struct whose resolved constructor spec is non-``None`` **decodes into a real
+class instance** (via ``mk``): structs with their own ``js_constructor``
+class kwarg get this automatically, and passing ``constructors=<spec>`` or
+``classes=True`` to `msgspec.javascript.codec` extends it to all structs
+(the module then also exports the schema definitions). ``classes=False``
+forces plain structural output.
+
+The ``constructors`` keyword sets the default constructor signature as a
+JS-style parameter-list spec - ``'{**}'`` (default, shown above),
+``'(*, **)'`` (required fields positional, optionals in a trailing object:
+``new Product(id, name, { tags })``), ``'(*)'`` (fully positional), explicit
+signatures like ``'(name, *, **)'`` or ``'(name, ...tags)'``, or ``None``
+(no classes; ``@typedef``/``@property`` documentation blocks instead). A
+Struct can pick its own signature via the ``js_constructor`` class kwarg,
+which always wins over ``constructors``. See :doc:`typescript` for details -
+the same keyword with the same semantics exists on
+`msgspec.typescript.schema`.
 
 
 Tagged unions and abstract structs

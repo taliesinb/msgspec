@@ -1,6 +1,6 @@
 from typing import Any, TypeVar, final
 
-from . import NODEFAULT, Struct
+from . import NODEFAULT, Struct, UnsetType
 
 _S = TypeVar("_S", bound=Struct)
 
@@ -27,6 +27,7 @@ class StructConfig:
     abstract: bool
     abstract_parents: list[type[Struct]] | None
     concrete_children: list[type[Struct]] | None
+    js_constructor: str | None | UnsetType
 
 class FieldInfo(Struct):
     name: str

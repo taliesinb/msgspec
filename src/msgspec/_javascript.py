@@ -18,17 +18,17 @@ parameter defaults document the fields' default values.
 
 from __future__ import annotations
 
-import enum
-import re
 import textwrap
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from . import inspect as mi, to_builtins
+from . import UNSET, _typescript_constructors as tc, inspect as mi
 from ._msgpack_runtime_js import RUNTIME as _MSGPACK_RUNTIME
 from ._typescript import (
     _IDENT_RE,
+    ConstructorsSpec,
+    _binding_name,
     _build_name_map,
     _collect_component_types as _collect_schema_component_types,
     _contains_tensor,
@@ -203,12 +203,23 @@ class _CodecGenerator:
         tensor_encoder: str | None = None,
         tensor_decoder: str | None = None,
         elide_implied_tag: bool = False,
+        mk_classes: frozenset = frozenset(),
     ):
         self.name_map = name_map
         self.tensor_encoder = tensor_encoder
         self.tensor_decoder = tensor_decoder
         self.elide_implied_tag = elide_implied_tag
+        # Classes whose decoders return real class instances (via the
+        # generated `mk` static factory) rather than plain objects.
+        self.mk_classes = mk_classes
         self._counter = 0
+
+    def _mk(self, name: str, t: mi.Type, expr: str) -> str:
+        """Wrap a decoded plain-object expression in `Name.mk(...)` when this
+        class decodes to a real instance."""
+        if t.cls in self.mk_classes:
+            return f"{name}.mk({expr})"
+        return expr
 
     def _elidable(self, t: mi.Type) -> bool:
         """Whether this struct's encode function takes a trailing ``tagged``
@@ -656,7 +667,7 @@ class _CodecGenerator:
             "for (let i = 0; i < n; i++) {\n"
             f"{_ind(switch)}\n"
             "}\n"
-            "return o;"
+            f"return {self._mk(name, t, 'o')};"
         )
         return f"export function decode{name}(r) {{\n{_ind(body)}\n}}"
 
@@ -671,7 +682,7 @@ class _CodecGenerator:
         for f in t.fields:
             lines.append(f"o[{_str(f.encode_name)}] = {self.dec(f.type)}; i++;")
         lines.append("while (i < n) { r.skip(); i++; }")
-        lines.append("return o;")
+        lines.append(f"return {self._mk(name, t, 'o')};")
         body = "\n".join(lines)
         return f"export function decode{name}(r) {{\n{_ind(body)}\n}}"
 
@@ -851,7 +862,8 @@ class _CodecGenerator:
             lines.append(
                 f"{_prop_name(f.encode_name)}: {self.json_dec(f.type, f'o[{_str(f.encode_name)}]')},"
             )
-        body = "return {\n" + _ind("\n".join(lines)) + "\n};"
+        obj = "{\n" + _ind("\n".join(lines)) + "\n}"
+        body = f"return {self._mk(name, t, obj)};"
         return f"export function decodeJson{name}(o) {{\n{_ind(body)}\n}}"
 
     def _json_enc_array_def(self, name: str, t: mi.Type) -> str:
@@ -872,7 +884,8 @@ class _CodecGenerator:
             lines.append(
                 f"{_prop_name(f.encode_name)}: {self.json_dec(f.type, f'o[{i + off}]')},"
             )
-        body = "return {\n" + _ind("\n".join(lines)) + "\n};"
+        obj = "{\n" + _ind("\n".join(lines)) + "\n}"
+        body = f"return {self._mk(name, t, obj)};"
         return f"export function decodeJson{name}(o) {{\n{_ind(body)}\n}}"
 
 
@@ -884,6 +897,8 @@ def codec(
     tensor_encoder: str | None = None,
     tensor_decoder: str | None = None,
     elide_implied_tag: bool = False,
+    classes: bool | None = None,
+    constructors: ConstructorsSpec = None,
 ) -> str:
     """Generate a self-contained JavaScript codec for ``type``.
 
@@ -924,6 +939,16 @@ def codec(
         concrete struct (rather than a union), matching a Python encoder
         constructed with ``elide_implied_tag=True``. Union positions still
         emit and dispatch on the tag. Defaults to ``False``.
+    classes, constructors : optional
+        Decode structs into real class instances. A struct decodes to an
+        instance of its generated schema class (constructed via the class's
+        ``mk`` static factory) whenever its resolved constructor spec is
+        non-``None``: by default that's only structs with their own
+        ``js_constructor`` class kwarg; passing ``constructors=<spec>``
+        (see `schema`) or ``classes=True`` (shorthand for
+        ``constructors="{**}"``) extends it to all structs. The module then
+        also exports the JSDoc schema definitions. ``classes=False`` forces
+        plain structural output regardless of class kwargs.
 
     Returns
     -------
@@ -932,18 +957,58 @@ def codec(
     """
     if not (msgpack or json):
         raise ValueError("at least one of `msgpack` / `json` must be enabled")
+    if classes is False and constructors is not None:
+        raise ValueError("`constructors` requires `classes` to not be False")
 
     (root,) = mi.multi_type_info([type])
     component_types = _collect_component_types([root])
     name_map = _build_name_map(component_types)
+
+    # Which structs decode into real class instances: those whose resolved
+    # constructor spec is non-None - their own `js_constructor` kwarg, a
+    # `constructors=` fallback, or `classes=True` (fallback `"{**}"`).
+    # `classes=False` forces plain structural output.
+    if classes is False:
+        fallback: Any = UNSET
+    elif constructors is not None:
+        fallback = constructors
+    elif classes:
+        fallback = "{**}"
+    else:
+        fallback = None  # per-class `js_constructor` kwargs only
+    schema_defs: list[str] = []
+    mk_classes: frozenset = frozenset()
+    if fallback is not UNSET:
+        s_infos = mi.multi_type_info([type], aliases=True)
+        s_components = _collect_schema_component_types(s_infos)
+        s_name_map = _build_name_map(s_components)
+        sgen = _JsSchemaGenerator(s_name_map, constructors=fallback)
+        mk_classes = frozenset(
+            cls
+            for cls, t in s_components.items()
+            if isinstance(t, _FUNC_TYPES)
+            and not isinstance(t, mi.AbstractStructType)
+            and sgen._expanded_for(t) is not None
+        )
+        if mk_classes:
+            # The module gains the JSDoc schema definitions (classes for the
+            # instance-decoding structs, typedefs/enums for the rest), and
+            # everything is named from the richer schema collection.
+            name_map = s_name_map
+            schema_defs = [
+                sgen.to_def(s_name_map[cls], t)
+                for cls, t in s_components.items()
+            ]
+
     gen = _CodecGenerator(
-        name_map, tensor_encoder, tensor_decoder, elide_implied_tag
+        name_map, tensor_encoder, tensor_decoder, elide_implied_tag, mk_classes
     )
 
     parts = [_MSGPACK_RUNTIME.strip()]
     if _contains_tensor(root):
         # Re-export the runtime's TensorHandle so callers can construct tensors.
         parts.append("export { TensorHandle };")
+    parts.extend(schema_defs)
 
     if msgpack:
         for cls, t in component_types.items():
@@ -982,106 +1047,12 @@ def codec(
 # JSDoc schema generation
 # ---------------------------------------------------------------------------
 
-# Words that can't be used as a plain destructuring binding in strict-mode JS.
-_JS_RESERVED = frozenset(
-    """
-    arguments await break case catch class const continue debugger default
-    delete do else enum eval export extends false finally for function if
-    implements import in instanceof interface let new null package private
-    protected public return static super switch this throw true try typeof
-    var void while with yield
-    """.split()
-)
-
 
 def _jsdoc_block(lines: list[str], indent: str = "") -> str:
     if len(lines) == 1:
         return f"{indent}/** {lines[0]} */"
     body = "\n".join(f"{indent} * {line}".rstrip() for line in lines)
     return f"{indent}/**\n{body}\n{indent} */"
-
-
-def _binding_name(name: str, used: set[str]) -> str:
-    """A valid, unused JS binding name for destructuring field `name`."""
-    out = re.sub(r"[^A-Za-z0-9_$]", "_", name) or "_"
-    if out[0].isdigit():
-        out = "_" + out
-    while out in _JS_RESERVED or out in used:
-        out += "_"
-    used.add(out)
-    return out
-
-
-def _builtin_literal(value: Any) -> str | None:
-    """Render a `to_builtins` output value as a JS literal, or None if it
-    has no clean literal form."""
-    if value is None or isinstance(value, (bool, str)):
-        return _literal_value(value)
-    if isinstance(value, int):
-        return repr(value)
-    if isinstance(value, float):
-        if value != value:
-            return "NaN"
-        if value == float("inf"):
-            return "Infinity"
-        if value == float("-inf"):
-            return "-Infinity"
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        items = [_builtin_literal(v) for v in value]
-        if any(i is None for i in items):
-            return None
-        return "[" + ", ".join(items) + "]"
-    if isinstance(value, dict):
-        parts = []
-        for k, v in value.items():
-            if not isinstance(k, str):
-                return None
-            vl = _builtin_literal(v)
-            if vl is None:
-                return None
-            parts.append(f"{_prop_name(k)}: {vl}")
-        return "{ " + ", ".join(parts) + " }" if parts else "{}"
-    return None
-
-
-def _default_literal(value: Any) -> str | None:
-    """Render a Python default value as a JS literal matching the value's
-    JSON wire form (sets excepted, which stay `Set`s in JS)."""
-    if isinstance(value, (set, frozenset)):
-        items = [_default_literal(v) for v in sorted(value, key=repr)]
-        if any(i is None for i in items):
-            return None
-        return f"new Set([{', '.join(items)}])" if items else "new Set()"
-    try:
-        value = to_builtins(value, str_keys=True)
-    except (TypeError, ValueError):
-        return None
-    return _builtin_literal(value)
-
-
-def _field_default_literal(f: mi.Field) -> str | None:
-    if f.default is not mi.NODEFAULT:
-        out = _default_literal(f.default)
-        if (
-            out is not None
-            and isinstance(f.default, int)
-            and not isinstance(f.default, bool)
-            and _is_bigint(_unwrap(f.type))
-        ):
-            out += "n"
-        return out
-    factory = f.default_factory
-    if factory is not mi.NODEFAULT:
-        if factory in (list, tuple):
-            return "[]"
-        if factory is dict:
-            return "{}"
-        if factory in (set, frozenset):
-            return "new Set()"
-        if factory in (bytes, bytearray):
-            return '""'
-    return None
 
 
 class _JsSchemaGenerator(_TsSchemaGenerator):
@@ -1127,6 +1098,12 @@ class _JsSchemaGenerator(_TsSchemaGenerator):
         return "\n".join(lines)
 
     def _object_def(self, name: str, t: mi.Type) -> str:
+        exp = self._expanded_for(t)
+        if exp is None:
+            # No constructor: a hollow class would fail strict checkJs
+            # (fields never definitely assigned), so emit the pure
+            # documentation form instead.
+            return self._object_typedef(name, t)
         tagged = isinstance(t, mi.StructType) and t.tag_field is not None
         lines = []
         if doc := _get_doc(t):
@@ -1142,89 +1119,163 @@ class _JsSchemaGenerator(_TsSchemaGenerator):
             lines.append(f"{_INDENT}{_prop_name(f.encode_name)};")
         if t.fields:
             lines.append("")
-            lines.extend(self._constructor_lines(t))
+            lines.extend(self._constructor_lines(t, exp))
+        lines.append("")
+        lines.extend(self._mk_lines(name))
         lines.append("}")
         return "\n".join(lines)
 
-    def _field_default(self, f: mi.Field) -> str | None:
-        # An enum-member default whose enum is a named component renders as a
-        # member access (`Fruit.APPLE`) rather than the raw value.
-        if isinstance(f.default, enum.Enum):
-            if name := self.name_map.get(type(f.default)):
-                member = f.default.name
-                if _IDENT_RE.match(member):
-                    return f"{name}.{member}"
-                return f"{name}[{_prop_name(member)}]"
-        return _field_default_literal(f)
+    def _mk_lines(self, name: str) -> list[str]:
+        return [
+            _jsdoc_block(
+                [f"@param {{{name}}} fields", f"@returns {{{name}}}"],
+                indent=_INDENT,
+            ),
+            f"{_INDENT}static mk(fields) {{",
+            f"{_INDENT}{_INDENT}return Object.assign("
+            f"Object.create({name}.prototype), fields);",
+            f"{_INDENT}}}",
+        ]
 
-    def _constructor_lines(self, t: mi.Type) -> list[str]:
-        all_optional = all(not f.required for f in t.fields)
-        param = "[fields]" if all_optional else "fields"
-        # The usual JSDoc idiom is one dotted `@param` per field, but `tsc`
-        # only accepts identifiers in dotted paths - if any field name needs
-        # quoting, fall back to a single inline object type (where quoted
-        # keys are valid).
-        if all(_IDENT_RE.match(f.encode_name) for f in t.fields):
-            doc = [f"@param {{Object}} {param}"]
-            for f in t.fields:
-                ref = self.to_ref(f.type)
-                fname = f"fields.{f.encode_name}"
-                doc.append(
-                    f"@param {{{ref}}} {fname}"
-                    if f.required
-                    else f"@param {{{ref}}} [{fname}]"
+    def _object_typedef(self, name: str, t: mi.Type) -> str:
+        tagged = isinstance(t, mi.StructType) and t.tag_field is not None
+        lines: list[str] = []
+        if doc := _get_doc(t):
+            lines.extend(doc.splitlines())
+        names = [t.tag_field] if tagged else []
+        names += [f.encode_name for f in t.fields]
+        # `@property` needs identifier names; fall back to an inline object
+        # type (where quoted keys are valid) when any field needs quoting.
+        if all(_IDENT_RE.match(n) for n in names):
+            lines.append(f"@typedef {{Object}} {name}")
+            if tagged:
+                lines.append(
+                    f"@property {{{_literal_value(t.tag)}}} {t.tag_field}"
                 )
+            for f in t.fields:
+                fname = f.encode_name if f.required else f"[{f.encode_name}]"
+                lines.append(f"@property {{{self.to_ref(f.type)}}} {fname}")
         else:
-            props = ", ".join(
+            props = []
+            if tagged:
+                props.append(
+                    f"{_prop_name(t.tag_field)}: {_literal_value(t.tag)}"
+                )
+            props += [
                 f"{_prop_name(f.encode_name)}{'' if f.required else '?'}: "
                 f"{self.to_ref(f.type)}"
                 for f in t.fields
-            )
-            doc = [f"@param {{{{ {props} }}}} {param}"]
-        entries = []
-        assigns = []
-        used: set[str] = set()
-        for f in t.fields:
-            binding = _binding_name(f.encode_name, used)
-            entry = (
-                binding
-                if binding == f.encode_name
-                else f"{_prop_name(f.encode_name)}: {binding}"
-            )
-            if not f.required and (default := self._field_default(f)) is not None:
-                entry += f" = {default}"
-            entries.append(entry)
-            if _IDENT_RE.match(f.encode_name):
-                assigns.append(f"this.{f.encode_name} = {binding};")
+            ]
+            lines.append(f"@typedef {{{{ {', '.join(props)} }}}} {name}")
+        return _jsdoc_block(lines)
+
+    def _constructor_lines(self, t: mi.Type, exp: tc.Expanded) -> list[str]:
+        doc: list[str] = []
+        params: list[str] = []
+        used = {b.arg.binding for b in exp.bound}
+
+        for i, e in enumerate(exp.params.elems):
+            if isinstance(e, tc.Bound):
+                doc.append(
+                    f"@param {{{e.arg.type}}} [{e.arg.binding}]"
+                    if e.optional
+                    else f"@param {{{e.arg.type}}} {e.arg.binding}"
+                )
             else:
-                assigns.append(f"this[{_prop_name(f.encode_name)}] = {binding};")
-        params = "{ " + ", ".join(entries) + " }"
-        if all_optional:
-            params += " = {}"
+                # A destructuring pattern has no binding of its own; document
+                # it under a placeholder name (tsc matches doc names to
+                # pattern parameters positionally).
+                pname = _binding_name("fields" if i == 0 else "opts", used)
+                disp = (
+                    f"[{pname}]"
+                    if self._pattern_default(e) is not None
+                    else pname
+                )
+                if self._dotted_ok(e):
+                    # The usual JSDoc idiom: `@param {Object} fields` plus one
+                    # dotted `@param` per entry. `tsc` only accepts identifiers
+                    # in dotted paths, and they can't express nested patterns
+                    # or rest entries - `_dotted_ok` guards all of that; other
+                    # patterns get a single inline type annotation instead.
+                    doc.append(f"@param {{Object}} {disp}")
+                    for key, val in e.items:
+                        path = f"{pname}.{key}"
+                        doc.append(
+                            f"@param {{{val.arg.type}}} [{path}]"
+                            if val.optional
+                            else f"@param {{{val.arg.type}}} {path}"
+                        )
+                else:
+                    doc.append(f"@param {{{self._pattern_type(e)}}} {disp}")
+            params.append(self._render_pattern(e))
+        if exp.params.rest is not None:
+            r = exp.params.rest
+            doc.append(f"@param {{...{self._rest_elem_type(r)}}} {r.arg.binding}")
+            params.append(f"...{r.arg.binding}")
+
         out = [_jsdoc_block(doc, indent=_INDENT)]
-        out.append(f"{_INDENT}constructor({params}) {{")
-        out.extend(f"{_INDENT}{_INDENT}{a}" for a in assigns)
+        out.append(f"{_INDENT}constructor({', '.join(params)}) {{")
+        out.extend(
+            f"{_INDENT}{_INDENT}{a}" for a in self._ctor_assigns(exp)
+        )
         out.append(f"{_INDENT}}}")
         return out
 
+    @staticmethod
+    def _dotted_ok(pat: tc.XPat) -> bool:
+        """Whether a pattern can be documented with dotted `@param` paths:
+        an object pattern with no rest entry whose every entry is a plain
+        binding under an identifier key."""
+        return (
+            isinstance(pat, tc.XObj)
+            and pat.rest is None
+            and all(
+                isinstance(val, tc.Bound) and _IDENT_RE.match(key)
+                for key, val in pat.items
+            )
+        )
 
-def schema(type: Any) -> str:
+    @staticmethod
+    def _rest_elem_type(r: tc.Bound) -> str:
+        """The element type for a `...rest` parameter's `@param {...T}` doc
+        (the field itself is an array type)."""
+        ref = r.arg.type
+        if ref.startswith("Array<") and ref.endswith(">"):
+            return ref[6:-1]
+        return "any"
+
+
+def schema(
+    type: Any, *, constructors: ConstructorsSpec = "{**}"
+) -> str:
     """Generate JSDoc-annotated JavaScript definitions for a given type.
 
     The output is plain JavaScript documented in the standard JSDoc idiom
     (fully understood by editors and ``tsc --checkJs``): struct-like types
     (structs, dataclasses, typed-dicts, named-tuples) become ``class``
-    definitions with ``@type``-annotated fields and a destructuring
-    constructor whose parameter defaults document the fields' default values;
-    enums become frozen ``@enum`` objects; named aliases and abstract structs
-    become ``@typedef`` declarations. If the top-level ``type`` is not itself
-    a nameable type (for example ``list[Point]``), a ``@typedef ... Root`` is
+    definitions with ``@type``-annotated fields and a constructor whose
+    parameter defaults document the fields' default values; enums become
+    frozen ``@enum`` objects; named aliases and abstract structs become
+    ``@typedef`` declarations. If the top-level ``type`` is not itself a
+    nameable type (for example ``list[Point]``), a ``@typedef ... Root`` is
     emitted to name it.
 
     Parameters
     ----------
     type : type
         The type to generate JavaScript definitions for.
+    constructors : str or None, optional
+        The default signature of generated class constructors, as a JS-style
+        parameter-list spec: ``"{**}"`` (the default) takes a single
+        keyword-arguments-style object with one entry per field;
+        ``"(*, **)"`` takes the required fields positionally plus a trailing
+        object of the optional ones; ``"(*)"`` is fully positional; explicit
+        signatures like ``"(name, *, **)"`` reorder, rename, or nest
+        bindings. ``None`` emits ``@typedef``/``@property`` documentation
+        blocks instead of classes. This value only applies to classes
+        without a ``js_constructor`` class kwarg of their own - a
+        class-level spec always wins. See `msgspec.typescript.schema` for
+        details - the same keyword with the same semantics.
 
     Returns
     -------
@@ -1236,7 +1287,9 @@ def schema(type: Any) -> str:
     schema_components
     msgspec.typescript.schema
     """
-    (root,), components = schema_components((type,))
+    (root,), components = schema_components(
+        (type,), constructors=constructors
+    )
 
     parts = list(components.values())
     # If the root type isn't a nameable component it won't already appear in
@@ -1248,6 +1301,8 @@ def schema(type: Any) -> str:
 
 def schema_components(
     types: Iterable[Any],
+    *,
+    constructors: ConstructorsSpec = "{**}",
 ) -> tuple[tuple[str, ...], dict[str, str]]:
     """Generate JSDoc-annotated JavaScript definitions for one or more types.
 
@@ -1255,6 +1310,9 @@ def schema_components(
     ----------
     types : Iterable[type]
         An iterable of one or more types to generate definitions for.
+    constructors : str or None, optional
+        The default signature spec of generated class constructors (classes
+        with their own ``js_constructor`` kwarg keep it); see `schema`.
 
     Returns
     -------
@@ -1278,7 +1336,7 @@ def schema_components(
 
     name_map = _build_name_map(component_types)
 
-    gen = _JsSchemaGenerator(name_map)
+    gen = _JsSchemaGenerator(name_map, constructors=constructors)
 
     refs = tuple(gen.to_ref(t) for t in type_infos)
 

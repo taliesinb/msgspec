@@ -49,12 +49,78 @@ is rendered inline.
       start: Point;
       end: Point;
       label?: string | null;
+
+      constructor({ start, end, label = null }: { start: Point, end: Point, label?: string | null }) {
+        this.start = start;
+        this.end = end;
+        this.label = label;
+      }
+
+      static mk(fields: Line): Line {
+        return Object.assign(Object.create(Line.prototype) as Line, fields);
+      }
     }
 
     export class Point {
       x: number;
       y: number;
+
+      constructor({ x, y }: { x: number, y: number }) {
+        this.x = x;
+        this.y = y;
+      }
+
+      static mk(fields: Point): Point {
+        return Object.assign(Object.create(Point.prototype) as Point, fields);
+      }
     }
+
+
+Constructors
+~~~~~~~~~~~~
+
+The ``constructors`` keyword sets the signature of the generated
+constructors (for both ``typescript.schema`` and ``javascript.schema``) as a
+JS-style parameter-list spec. In a spec, ``*`` stands for the struct's
+required fields and ``**`` for its optional ones (a lone ``*`` or ``**``
+means *all* fields); named bindings, defaults, destructuring patterns, and
+``...rest`` splats follow JavaScript's own parameter grammar:
+
+- ``'{**}'`` (default): a single keyword-arguments-style object -
+  ``new Line({ start, end })`` - mirroring Struct construction in Python.
+- ``'(*, **)'``: required fields positionally, optional fields in a trailing
+  options object - ``new Line(start, end, { label })``.
+- ``'(*)'``: one positional parameter per field in msgspec's field order,
+  with optional fields as parameter defaults - ``new Line(start, end, label)``.
+- ``'(end, start, *, **)'``: explicit signatures name fields directly, and
+  splices expand the rest where they occur; ``'(x = 0, y = 0)'`` overrides
+  defaults; ``'([x, y])'`` destructures; ``'(name, ...points)'`` collects
+  rest arguments into a list field; ``'{pos: [x, y]}'`` renames object keys
+  and nests.
+- ``None``: no constructors. TypeScript classes become declaration-only
+  shapes; the JavaScript schema emits ``@typedef``/``@property`` blocks
+  instead of classes.
+
+A Struct can also carry its signature on the class itself via the
+``js_constructor`` class kwarg - ``class Line(Struct, js_constructor="(*, **)")``
+- which is inherited by subclasses (``js_constructor=None`` opts a class out
+of constructors). The ``constructors`` keyword is just the fallback for
+classes without their own spec - a class-level ``js_constructor`` always
+wins. (Schemas embedded in codec output never emit constructors.)
+
+Every class with a constructor also gets a ``static mk(fields)`` factory -
+the JavaScript analog of Python's ``__new__``. It builds an instance from a
+plain all-fields object (``Object.assign(Object.create(...), fields)``),
+bypassing the constructor signature entirely; whatever exotic signature a
+class picks, ``mk`` stays uniform. Codec decoders use it to return real
+class instances (see below).
+
+Field defaults become executable parameter defaults wherever they have a
+clean JavaScript literal form (``null``, scalars, ``[]``, ``{}``,
+``new Set()``, enum members as ``Fruit.APPLE``, ...). Note that with
+positional specs the field order becomes part of the generated API -
+reordering struct fields in Python is then a breaking change for
+TypeScript/JavaScript callers.
 
 
 Type mapping
@@ -118,9 +184,18 @@ wherever the schema position is a single concrete struct (union positions keep
 it), matching a Python encoder constructed with the same option.
 
 Which namespaces to emit is controlled by the ``msgpack`` / ``json`` flags
-(both ``True`` by default). Struct shapes are emitted as ``interface`` (the
-codec works with plain objects), and the output type-checks under ``tsc
---strict``.
+(both ``True`` by default). By default struct shapes are emitted as
+``interface`` (the codec works with plain objects), and the output
+type-checks under ``tsc --strict``.
+
+A struct instead becomes a real ``class`` - with a constructor and ``mk``
+factory, and **decoded into class instances** (via ``mk``) - whenever its
+resolved constructor spec is non-``None``: structs carrying their own
+``js_constructor`` class kwarg get this automatically, and passing
+``constructors=<spec>`` or ``classes=True`` (shorthand for
+``constructors="{**}"``) to ``codec`` extends it to all structs.
+``classes=False`` forces plain structural output. Encoding accepts class
+instances and plain objects alike either way.
 
 .. note::
 

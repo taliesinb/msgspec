@@ -141,8 +141,8 @@ def test_tagged_union():
         woof: str
 
     out = ts(Union[Cat, Dog])
-    assert '  type: "cat";' in out
-    assert '  type: "dog";' in out
+    assert '  type: "cat" = "cat";' in out
+    assert '  type: "dog" = "dog";' in out
     assert "export type Root = Cat | Dog;" in out
 
 
@@ -165,7 +165,7 @@ def test_array_like_tagged_struct_is_class_with_tag():
 
     out = ts(Rec)
     assert "export class Rec {" in out
-    assert '  type: "rec";' in out
+    assert '  type: "rec" = "rec";' in out
     assert "  a: number;" in out
 
 
@@ -881,3 +881,360 @@ class TestCodecEmbedElideImpliedTag:
             msgspec.typescript.codec(
                 self._doc(), embed_msgpack=False, elide_implied_tag=True
             )
+
+
+class TestConstructorSpecParser:
+    """Direct tests of the signature parser / expander in
+    `msgspec._typescript_constructors`."""
+
+    def test_parse_basic_forms(self):
+        from msgspec import _typescript_constructors as tc
+
+        sig = tc.parse_constructor_spec("(a, *, **)")
+        assert sig.keys == ["a"]
+        [sym, req, opt] = sig.args.elems
+        assert isinstance(sym, tc.Symbol) and sym.name == "a"
+        assert isinstance(req, tc.Splice) and req.kind == "req"
+        assert isinstance(opt, tc.Obj)
+
+    def test_single_splice_means_all(self):
+        from msgspec import _typescript_constructors as tc
+
+        (sp,) = tc.parse_constructor_spec("(*)").args.elems
+        assert sp.kind == "all"
+        (ob,) = tc.parse_constructor_spec("{**}").args.elems
+        assert ob.elems[0].kind == "all"
+
+    def test_parse_defaults_and_nesting(self):
+        from msgspec import _typescript_constructors as tc
+
+        sig = tc.parse_constructor_spec("({X: {Y: [a, b = 'z', *, ...c]}})")
+        assert sig.keys == ["a", "b", "c"]
+        (outer,) = sig.args.elems
+        inner = outer.elems[0].val.elems[0].val
+        assert isinstance(inner, tc.Seq)
+        assert inner.elems[1].default == "'z'"
+        assert inner.splat == "c"
+
+    def test_duplicate_binding_raises(self):
+        from msgspec import _typescript_constructors as tc
+
+        with pytest.raises(SyntaxError, match="more than once"):
+            tc.parse_constructor_spec("(a, a)")
+
+    def test_double_splice_raises(self):
+        from msgspec import _typescript_constructors as tc
+
+        with pytest.raises(SyntaxError, match="spliced more than once"):
+            tc.parse_constructor_spec("(*, *)")
+
+    def test_expand_splices_and_extras(self):
+        from msgspec import _typescript_constructors as tc
+
+        args = [
+            tc.FieldArg("a", "a", "a", "number", None, True),
+            tc.FieldArg("b", "b", "b", "string", '"x"', False),
+            tc.FieldArg("c", "c", "c", "boolean", None, False),
+        ]
+        exp = tc.expand_signature(tc.parse_constructor_spec("(b, *)"), args)
+        # b bound explicitly (field default merged in), the splice picks up a
+        # and c, nothing left over.
+        assert [b.arg.name for b in exp.bound] == ["b", "a", "c"]
+        assert exp.bound[0].default == '"x"'
+        assert exp.extras == []
+
+        exp = tc.expand_signature(tc.parse_constructor_spec("(a)"), args)
+        assert [a.name for a in exp.extras] == ["b", "c"]
+
+
+class TestConstructorsSpec:
+    def test_object_default(self):
+        class Point(Struct):
+            x: int
+            label: str = "origin"
+
+        out = ts(Point)
+        assert (
+            'constructor({ x, label = "origin" }: { x: number, label?: string }) {'
+            in out
+        )
+        assert "    this.x = x;" in out
+
+    def test_split(self):
+        class Point(Struct):
+            x: int
+            y: int
+            label: str = "origin"
+
+        out = msgspec.typescript.schema(Point, constructors="(*, **)")
+        assert (
+            "constructor(x: number, y: number, "
+            '{ label = "origin" }: { label?: string } = {}) {' in out
+        )
+
+    def test_split_no_optionals_is_positional(self):
+        class Point(Struct):
+            x: int
+            y: int
+
+        out = msgspec.typescript.schema(Point, constructors="(*, **)")
+        assert "constructor(x: number, y: number) {" in out
+
+    def test_positional(self):
+        class Point(Struct):
+            x: int
+            label: str = "origin"
+
+        out = msgspec.typescript.schema(Point, constructors="(*)")
+        assert 'constructor(x: number, label: string = "origin") {' in out
+
+    def test_none_declaration_only(self):
+        class Rec(Struct, tag="rec"):
+            a: int
+            b: str = "x"
+
+        out = msgspec.typescript.schema(Rec, constructors=None)
+        assert "constructor" not in out
+        assert '  type: "rec";' in out
+        assert "  a: number;" in out
+        assert "  b?: string;" in out
+
+    def test_all_optional_object_param_defaults_empty(self):
+        class Config(Struct):
+            a: int = 0
+
+        out = ts(Config)
+        assert "constructor({ a = 0 }: { a?: number } = {}) {" in out
+
+    def test_explicit_signature(self):
+        class Point(Struct):
+            x: int
+            y: int
+            label: str = "origin"
+
+        out = msgspec.typescript.schema(Point, constructors="(y, x, *, **)")
+        assert (
+            "constructor(y: number, x: number, "
+            '{ label = "origin" }: { label?: string } = {}) {' in out
+        )
+
+    def test_explicit_defaults_override(self):
+        class Point(Struct):
+            x: int
+            label: str = "origin"
+
+        out = msgspec.typescript.schema(
+            Point, constructors="(x = 0, label = \'p\')"
+        )
+        assert "constructor(x: number = 0, label: string = 'p') {" in out
+
+    def test_rest_param(self):
+        class Path(Struct):
+            name: str
+            points: List[int] = []
+
+        out = msgspec.typescript.schema(Path, constructors="(name, ...points)")
+        assert "constructor(name: string, ...points: Array<number>) {" in out
+        assert "this.points = points;" in out
+
+    def test_renamed_object_key(self):
+        class Point(Struct):
+            x: int
+
+        out = msgspec.typescript.schema(Point, constructors="{X: x}")
+        assert "constructor({ X: x }: { X: number }) {" in out
+        assert "this.x = x;" in out
+
+    def test_nested_seq_pattern(self):
+        class Point(Struct):
+            x: int
+            y: int
+
+        out = msgspec.typescript.schema(Point, constructors="([x, y])")
+        assert "constructor([x, y]: [number, number]) {" in out
+
+    def test_unbound_required_raises(self):
+        class Point(Struct):
+            x: int
+            y: int
+
+        with pytest.raises(ValueError, match="unbound"):
+            msgspec.typescript.schema(Point, constructors="(x)")
+
+    def test_unknown_field_raises(self):
+        class Point(Struct):
+            x: int
+
+        with pytest.raises(ValueError, match="unknown field"):
+            msgspec.typescript.schema(Point, constructors="(x, z)")
+
+    def test_invalid_spec_raises(self):
+        class Point(Struct):
+            x: int
+
+        with pytest.raises(SyntaxError):
+            msgspec.typescript.schema(Point, constructors="bogus")
+
+    def test_js_constructor_class_kwarg(self):
+        class Point(Struct, js_constructor="(*)"):
+            x: int
+            label: str = "origin"
+
+        out = ts(Point)
+        assert 'constructor(x: number, label: string = "origin") {' in out
+
+    def test_js_constructor_none_disables(self):
+        class Rec(Struct, js_constructor=None):
+            a: int
+
+        out = ts(Rec)
+        assert "constructor" not in out
+
+    def test_js_constructor_wins_over_constructors_arg(self):
+        class Point(Struct, js_constructor="(*)"):
+            x: int
+
+        out = msgspec.typescript.schema(Point, constructors="{**}")
+        assert "constructor(x: number) {" in out
+
+        # ... including over `constructors=None`.
+        out = msgspec.typescript.schema(Point, constructors=None)
+        assert "constructor(x: number) {" in out
+
+    def test_mk_static_factory(self):
+        class Point(Struct):
+            x: int
+
+        out = ts(Point)
+        assert "static mk(fields: Point): Point {" in out
+        assert (
+            "return Object.assign("
+            "Object.create(Point.prototype) as Point, fields);" in out
+        )
+
+    def test_codec_uses_class_for_js_constructor_structs(self):
+        class Plain(Struct):
+            n: int
+
+        class Point(Struct, js_constructor="(*)"):
+            x: int
+            p: Plain
+
+        out = msgspec.typescript.codec(Point)
+        # Point decodes to a real instance via its class's `mk`...
+        assert "export class Point" in out
+        assert "constructor(x: number, p: Plain) {" in out
+        assert "static mk(fields: Point): Point {" in out
+        assert "return Point.mk(o);" in out
+        # ...while kwarg-less structs stay structural.
+        assert "export interface Plain" in out
+        assert "return Plain.mk" not in out
+
+    def test_codec_classes_flag(self):
+        class Point(Struct):
+            x: int
+
+        out = msgspec.typescript.codec(Point, classes=True)
+        assert "export class Point" in out
+        assert "return Point.mk(o);" in out
+
+        out = msgspec.typescript.codec(Point, constructors="(*)")
+        assert "constructor(x: number) {" in out
+        assert "return Point.mk(o);" in out
+
+    @needs_tsc
+    def test_codec_classes_tsc_strict_compiles(self, tmp_path):
+        class Point(Struct, js_constructor="(x, y)"):
+            x: int
+            y: int
+
+        class Doc(Struct):
+            pts: List[Point]
+            tags: Dict[str, str]
+
+        src = msgspec.typescript.codec(Doc, classes=True)
+        src += (
+            "\nconst d = new Doc({ pts: [new Point(1, 2)], tags: {} });\n"
+            "const b: Doc = msgpack.decode(msgpack.encode(d));\n"
+            "const j: Doc = json.decode(json.encode(d));\n"
+            "console.log(b instanceof Doc, j.pts[0] instanceof Point);\n"
+        )
+        path = tmp_path / "codec.ts"
+        path.write_text(src)
+        res = subprocess.run(
+            [TSC, "--noEmit", "--strict", "--target", "es2022", str(path)],
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+
+    def test_codec_classes_false_forces_structural(self):
+        class Point(Struct, js_constructor="(*)"):
+            x: int
+
+        out = msgspec.typescript.codec(Point, classes=False)
+        assert "export interface Point" in out
+        assert "Point.mk" not in out
+
+        with pytest.raises(ValueError, match="classes"):
+            msgspec.typescript.codec(Point, classes=False, constructors="(*)")
+
+    @needs_tsc
+    @pytest.mark.parametrize(
+        "mode", ["{**}", "(*, **)", "(*)", "(dog, *, **)", "(*, ...tags)"]
+    )
+    def test_tsc_strict_compiles(self, mode, tmp_path):
+        class Fruit(enum.Enum):
+            APPLE = "apple"
+
+        class Dog(Struct, tag="dog"):
+            name: str
+            barks: bool = True
+
+        # Field-specific signatures apply to Config via its class kwarg;
+        # other classes (Dog) keep the default spec.
+        class Config(Struct, js_constructor=mode):
+            dog: Dog
+            fruit: Fruit = Fruit.APPLE
+            tags: List[str] = []
+
+        src = msgspec.typescript.schema(Config)
+        path = tmp_path / "schema.ts"
+        path.write_text(src)
+        res = subprocess.run(
+            [TSC, "--noEmit", "--strict", "--target", "es2022", str(path)],
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+
+    def test_per_class_kwargs_mix(self):
+        class A(Struct, js_constructor="(*)"):
+            x: int
+
+        class B(Struct, js_constructor="(*, **)"):
+            a: A
+            n: int = 0
+
+        out = msgspec.typescript.schema(B)
+        assert "constructor(a: A, { n = 0 }: { n?: number } = {}) {" in out
+        assert "constructor(x: number) {" in out
+
+    def test_class_kwarg_none_opts_out(self):
+        class A(Struct, js_constructor=None):
+            x: int
+
+        class B(Struct):
+            a: A
+
+        # A opts out; B keeps the default `{**}` spec.
+        out = msgspec.typescript.schema(B)
+        assert "constructor({ x" not in out
+        assert "constructor({ a }: { a: A }) {" in out
+
+    def test_non_str_spec_raises(self):
+        class A(Struct):
+            x: int
+
+        with pytest.raises(TypeError, match="must be a str or None"):
+            msgspec.typescript.schema(A, constructors={A: "{**}"})

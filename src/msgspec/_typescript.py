@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import enum
+import functools
 import re
 import textwrap
 from collections.abc import Iterable
 from typing import Any
 
-from . import inspect as mi
+from . import UNSET, _typescript_constructors as tc, inspect as mi, to_builtins
 from ._msgpack_runtime_ts import RUNTIME as _MSGPACK_RUNTIME_TS
 
 __all__ = ("schema", "schema_components", "codec")
@@ -19,6 +21,9 @@ def _ts_sig_swap(src: str, js_sig: str, ts_sig: str) -> str:
 
 # Matches a valid (unquoted) TypeScript identifier.
 _IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+# A constructor spec: a signature string, or None for no constructors.
+ConstructorsSpec = str | None
 
 _INDENT = "  "
 
@@ -39,7 +44,9 @@ _DTYPE_TS_TENSOR = {
 }
 
 
-def schema(type: Any) -> str:
+def schema(
+    type: Any, *, constructors: ConstructorsSpec = "{**}"
+) -> str:
     """Generate TypeScript type definitions for a given type.
 
     Struct types (and other "nameable" types like enums, dataclasses,
@@ -52,6 +59,18 @@ def schema(type: Any) -> str:
     ----------
     type : type
         The type to generate TypeScript definitions for.
+    constructors : str or None, optional
+        The default signature of generated class constructors, as a JS-style
+        parameter-list spec: ``"{**}"`` (the default) takes a single
+        keyword-arguments-style object with one entry per field;
+        ``"(*, **)"`` takes the required fields positionally plus a trailing
+        object of the optional ones; ``"(*)"`` is fully positional; explicit
+        signatures like ``"(name, *, **)"`` or ``"(x, y, ...rest)"``
+        reorder, rename, or nest bindings (see
+        ``msgspec._typescript_constructors`` for the full grammar). ``None``
+        emits no constructors (declaration-only shapes). This value only
+        applies to classes without a ``js_constructor`` class kwarg of their
+        own - a class-level spec always wins.
 
     Returns
     -------
@@ -62,7 +81,9 @@ def schema(type: Any) -> str:
     --------
     schema_components
     """
-    (root,), components = schema_components((type,))
+    (root,), components = schema_components(
+        (type,), constructors=constructors
+    )
 
     parts = list(components.values())
     # If the root type isn't a nameable component it won't already appear in
@@ -74,6 +95,8 @@ def schema(type: Any) -> str:
 
 def schema_components(
     types: Iterable[Any],
+    *,
+    constructors: ConstructorsSpec = "{**}",
 ) -> tuple[tuple[str, ...], dict[str, str]]:
     """Generate TypeScript definitions for one or more types.
 
@@ -81,6 +104,9 @@ def schema_components(
     ----------
     types : Iterable[type]
         An iterable of one or more types to generate definitions for.
+    constructors : str or None, optional
+        The default signature spec of generated class constructors (classes
+        with their own ``js_constructor`` kwarg keep it); see `schema`.
 
     Returns
     -------
@@ -103,7 +129,7 @@ def schema_components(
 
     name_map = _build_name_map(component_types)
 
-    gen = _SchemaGenerator(name_map)
+    gen = _SchemaGenerator(name_map, constructors=constructors)
 
     refs = tuple(gen.to_ref(t) for t in type_infos)
 
@@ -246,13 +272,281 @@ def _jsdoc(doc: str) -> str:
     return f"/**\n{body}\n */\n"
 
 
+# Constructor signatures for generated schema classes are JS-style
+# parameter-list specs (see `_typescript_constructors` for the grammar and
+# parser). `"{**}"` - a single keyword-arguments-style object - is the
+# default; a Struct can pick its own via the `js_constructor` class kwarg.
+_parse_spec = functools.lru_cache(maxsize=None)(tc.parse_constructor_spec)
+
+# Words that can't be used as a plain destructuring binding in strict-mode JS.
+_JS_RESERVED = frozenset(
+    """
+    arguments await break case catch class const continue debugger default
+    delete do else enum eval export extends false finally for function if
+    implements import in instanceof interface let new null package private
+    protected public return static super switch this throw true try typeof
+    var void while with yield
+    """.split()
+)
+
+
+def _binding_name(name: str, used: set[str]) -> str:
+    """A valid, unused JS binding name for destructuring field `name`."""
+    out = re.sub(r"[^A-Za-z0-9_$]", "_", name) or "_"
+    if out[0].isdigit():
+        out = "_" + out
+    while out in _JS_RESERVED or out in used:
+        out += "_"
+    used.add(out)
+    return out
+
+
+def _builtin_literal(value: Any) -> str | None:
+    """Render a `to_builtins` output value as a JS literal, or None if it
+    has no clean literal form."""
+    if value is None or isinstance(value, (bool, str)):
+        return _literal_value(value)
+    if isinstance(value, int):
+        return repr(value)
+    if isinstance(value, float):
+        if value != value:
+            return "NaN"
+        if value == float("inf"):
+            return "Infinity"
+        if value == float("-inf"):
+            return "-Infinity"
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        items = [_builtin_literal(v) for v in value]
+        if any(i is None for i in items):
+            return None
+        return "[" + ", ".join(items) + "]"
+    if isinstance(value, dict):
+        parts = []
+        for k, v in value.items():
+            if not isinstance(k, str):
+                return None
+            vl = _builtin_literal(v)
+            if vl is None:
+                return None
+            parts.append(f"{_prop_name(k)}: {vl}")
+        return "{ " + ", ".join(parts) + " }" if parts else "{}"
+    return None
+
+
+def _default_literal(value: Any) -> str | None:
+    """Render a Python default value as a JS literal matching the value's
+    JSON wire form (sets excepted, which stay `Set`s in JS)."""
+    if isinstance(value, (set, frozenset)):
+        items = [_default_literal(v) for v in sorted(value, key=repr)]
+        if any(i is None for i in items):
+            return None
+        return f"new Set([{', '.join(items)}])" if items else "new Set()"
+    try:
+        value = to_builtins(value, str_keys=True)
+    except (TypeError, ValueError):
+        return None
+    return _builtin_literal(value)
+
+
+def _field_default_literal(f: mi.Field) -> str | None:
+    if f.default is not mi.NODEFAULT:
+        out = _default_literal(f.default)
+        if (
+            out is not None
+            and isinstance(f.default, int)
+            and not isinstance(f.default, bool)
+            and _is_bigint(_unwrap(f.type))
+        ):
+            out += "n"
+        return out
+    factory = f.default_factory
+    if factory is not mi.NODEFAULT:
+        if factory in (list, tuple):
+            return "[]"
+        if factory is dict:
+            return "{}"
+        if factory in (set, frozenset):
+            return "new Set()"
+        if factory in (bytes, bytearray):
+            return '""'
+    return None
+
+
 class _SchemaGenerator:
-    def __init__(self, name_map: dict[Any, str], embed: bool = False):
+
+    def __init__(
+        self,
+        name_map: dict[Any, str],
+        embed: bool = False,
+        constructors: Any = UNSET,
+    ):
         self.name_map = name_map
         # In the embedded codec the in-memory value for `bytes` is a
         # `Uint8Array` (base64 only appears on the JSON wire), so the type must
         # reflect that rather than the `string` used by the schema.
         self.embed = embed
+        # `UNSET` (the default, used by the codec generators) turns the
+        # constructor machinery off entirely - even per-class `js_constructor`
+        # kwargs are ignored, since codec shapes must stay declaration-only.
+        # Validate a real spec eagerly so errors surface at call time rather
+        # than mid-generation.
+        if constructors is not UNSET and constructors is not None:
+            if not isinstance(constructors, str):
+                raise TypeError(
+                    f"`constructors` must be a str or None, got {constructors!r}"
+                )
+            _parse_spec(constructors)
+        self.constructors = constructors
+
+    def _field_default(self, f: mi.Field) -> str | None:
+        # An enum-member default whose enum is a named component renders as a
+        # member access (`Fruit.APPLE`) rather than the raw value.
+        if isinstance(f.default, enum.Enum):
+            if name := self.name_map.get(type(f.default)):
+                member = f.default.name
+                if _IDENT_RE.match(member):
+                    return f"{name}.{member}"
+                return f"{name}[{_prop_name(member)}]"
+        return _field_default_literal(f)
+
+    # -- constructor expansion ---------------------------------------------
+
+    def _class_constructor(self, t: mi.Type, fallback: str | None) -> str | None:
+        """A Struct's own `js_constructor` class kwarg, if set."""
+        cfg = getattr(t.cls, "__struct_config__", None)
+        spec = getattr(cfg, "js_constructor", UNSET)
+        return fallback if spec is UNSET else spec
+
+    def _expanded_for(self, t: mi.Type) -> tc.Expanded | None:
+        """Resolve the constructor spec for a class and expand it against the
+        class's fields, or None if it gets no constructor.
+
+        A class's own `js_constructor` kwarg wins; the generator-level
+        `constructors` value is the fallback for classes without one.
+        """
+        if self.constructors is UNSET:  # codec paths: no constructors at all
+            return None
+        spec = self._class_constructor(t, self.constructors)
+        if spec is None:
+            return None
+        return tc.expand_signature(_parse_spec(spec), self._field_args(t))
+
+    def _field_args(self, t: mi.Type) -> list[tc.FieldArg]:
+        """Pre-render each field for the constructor expander: type ref,
+        default literal, and a sanitized unique binding name."""
+        used: set[str] = set()
+        return [
+            tc.FieldArg(
+                name=f.name,
+                prop=f.encode_name,
+                binding=_binding_name(f.encode_name, used),
+                type=self.to_ref(f.type),
+                default=None if f.required else self._field_default(f),
+                required=f.required,
+            )
+            for f in t.fields
+        ]
+
+    # -- pattern rendering --------------------------------------------------
+
+    def _render_pattern(self, pat: tc.XPat, top: bool = False) -> str:
+        """Render an expanded pattern as plain-JS destructuring text. With
+        `top=True` the outermost default is omitted (TypeScript renders it
+        after the type annotation instead)."""
+        if isinstance(pat, tc.Bound):
+            if not top and pat.default is not None:
+                return f"{pat.arg.binding} = {pat.default}"
+            return pat.arg.binding
+        if isinstance(pat, tc.XSeq):
+            parts = [self._render_pattern(e) for e in pat.elems]
+            if pat.rest is not None:
+                parts.append(f"...{pat.rest.arg.binding}")
+            out = f"[{', '.join(parts)}]"
+        else:
+            parts = []
+            for key, val in pat.items:
+                if isinstance(val, tc.Bound) and val.arg.binding == key:
+                    parts.append(self._render_pattern(val))
+                else:
+                    parts.append(
+                        f"{_prop_name(key)}: {self._render_pattern(val)}"
+                    )
+            if pat.rest is not None:
+                parts.append(f"...{pat.rest.arg.binding}")
+            out = "{ " + ", ".join(parts) + " }" if parts else "{}"
+        if not top and (d := self._pattern_default(pat)) is not None:
+            out += f" = {d}"
+        return out
+
+    def _pattern_default(self, pat: tc.XPat) -> str | None:
+        """A pattern's default: the explicit spec default, else an automatic
+        `{}` for an object pattern all of whose bindings have defaults (so
+        the whole argument can be omitted)."""
+        if isinstance(pat, tc.Bound):
+            return pat.default
+        if pat.default is not None:
+            return pat.default
+        if (
+            isinstance(pat, tc.XObj)
+            and (pat.items or pat.rest)
+            and all(self._omittable(v) for _, v in pat.items)
+        ):
+            return "{}"
+        return None
+
+    def _omittable(self, pat: tc.XPat) -> bool:
+        if isinstance(pat, tc.Bound):
+            return pat.default is not None
+        return self._pattern_default(pat) is not None
+
+    def _pattern_type(self, pat: tc.XPat) -> str:
+        """The TypeScript type annotation for an expanded pattern."""
+        if isinstance(pat, tc.Bound):
+            return pat.arg.type
+        if isinstance(pat, tc.XSeq):
+            elems = []
+            for e in pat.elems:
+                ref = self._pattern_type(e)
+                if self._elem_optional(e):
+                    if " | " in ref:
+                        ref = f"({ref})"
+                    ref += "?"
+                elems.append(ref)
+            if pat.rest is not None:
+                elems.append(f"...{pat.rest.arg.type}")
+            return f"[{', '.join(elems)}]"
+        props = [
+            f"{_prop_name(key)}{'?' if self._elem_optional(val) else ''}: "
+            f"{self._pattern_type(val)}"
+            for key, val in pat.items
+        ]
+        out = "{ " + ", ".join(props) + " }" if props else "{}"
+        if pat.rest is not None:
+            out = f"{out} & {pat.rest.arg.type}" if pat.items else pat.rest.arg.type
+        return out
+
+    def _elem_optional(self, pat: tc.XPat) -> bool:
+        if isinstance(pat, tc.Bound):
+            return pat.optional
+        return self._pattern_default(pat) is not None
+
+    def _ctor_assigns(self, exp: tc.Expanded) -> list[str]:
+        """Constructor-body assignments: every bound field from its binding,
+        plus unbound optional fields from their defaults."""
+
+        def target(prop: str) -> str:
+            if _IDENT_RE.match(prop):
+                return f"this.{prop}"
+            return f"this[{_prop_name(prop)}]"
+
+        lines = [f"{target(b.arg.prop)} = {b.arg.binding};" for b in exp.bound]
+        lines += [
+            f"{target(a.prop)} = {a.default};"
+            for a in exp.extras
+            if a.default is not None
+        ]
+        return lines
 
     def to_ref(self, t: mi.Type) -> str:
         """Render a Type as an inline TypeScript type reference."""
@@ -382,18 +676,68 @@ class _SchemaGenerator:
         )
 
     def _object_def(self, name: str, t: mi.Type) -> str:
+        exp = self._expanded_for(t)
         lines = []
         if doc := _get_doc(t):
             lines.append(_jsdoc(doc).rstrip("\n"))
         lines.append(f"export class {name} {{")
         if isinstance(t, mi.StructType) and t.tag_field is not None:
-            lines.append(
-                f"{_INDENT}{_prop_name(t.tag_field)}: {_literal_value(t.tag)};"
-            )
+            tag = _literal_value(t.tag)
+            if exp is None:
+                lines.append(f"{_INDENT}{_prop_name(t.tag_field)}: {tag};")
+            else:
+                # With a constructor the class is meant to compile as real
+                # code, so the tag needs a definite assignment.
+                lines.append(f"{_INDENT}{_prop_name(t.tag_field)}: {tag} = {tag};")
         for field in t.fields:
             lines.append(self._field_line(field))
+        if exp is not None and t.fields:
+            lines.append("")
+            lines.extend(self._constructor_lines(t, exp))
+        if exp is not None:
+            # `mk` is the `__new__`-like escape hatch: build an instance from
+            # a plain all-fields object, bypassing the constructor signature.
+            # Decoders use it to return real class instances.
+            lines.append("")
+            lines.extend(self._mk_lines(name))
         lines.append("}")
         return "\n".join(lines)
+
+    def _mk_lines(self, name: str) -> list[str]:
+        return [
+            f"{_INDENT}static mk(fields: {name}): {name} {{",
+            f"{_INDENT}{_INDENT}return Object.assign("
+            f"Object.create({name}.prototype) as {name}, fields);",
+            f"{_INDENT}}}",
+        ]
+
+    def _constructor_lines(self, t: mi.Type, exp: tc.Expanded) -> list[str]:
+        params = []
+        for e in exp.params.elems:
+            if isinstance(e, tc.Bound):
+                if e.default is not None:
+                    params.append(f"{e.arg.binding}: {e.arg.type} = {e.default}")
+                elif e.arg.required:
+                    params.append(f"{e.arg.binding}: {e.arg.type}")
+                else:
+                    params.append(f"{e.arg.binding}?: {e.arg.type}")
+            else:
+                # Destructuring patterns are annotated as a whole:
+                # `{ a, b = 1 }: { a: T, b?: U } = {}`.
+                param = (
+                    f"{self._render_pattern(e, top=True)}: "
+                    f"{self._pattern_type(e)}"
+                )
+                if (d := self._pattern_default(e)) is not None:
+                    param += f" = {d}"
+                params.append(param)
+        if exp.params.rest is not None:
+            r = exp.params.rest
+            params.append(f"...{r.arg.binding}: {r.arg.type}")
+        out = [f"{_INDENT}constructor({', '.join(params)}) {{"]
+        out.extend(f"{_INDENT}{_INDENT}{a}" for a in self._ctor_assigns(exp))
+        out.append(f"{_INDENT}}}")
+        return out
 
 
 # Types whose TypeScript value is already exactly the MessagePack wire value, so
@@ -887,6 +1231,8 @@ def codec(
     tensor_decoder: str | None = None,
     force_int64: bool = False,
     elide_implied_tag: bool = False,
+    classes: bool | None = None,
+    constructors: ConstructorsSpec = None,
 ) -> str:
     """Generate TypeScript type definitions plus a MessagePack/JSON codec.
 
@@ -922,6 +1268,16 @@ def codec(
         constructed with ``elide_implied_tag=True``. Union positions still
         emit and dispatch on the tag. Only supported with
         ``embed_msgpack=True``. Defaults to ``False``.
+    classes, constructors : optional
+        Decode structs into real class instances. A struct is emitted as a
+        ``class`` (with a constructor and a ``mk`` static factory) rather
+        than an ``interface``, and decodes to an instance of it, whenever
+        its resolved constructor spec is non-``None``: by default that's
+        only structs with their own ``js_constructor`` class kwarg; passing
+        ``constructors=<spec>`` (see `schema`) or ``classes=True``
+        (shorthand for ``constructors="{**}"``) extends it to all structs.
+        ``classes=False`` forces plain structural output regardless of
+        class kwargs. Only supported with ``embed_msgpack=True``.
 
     Returns
     -------
@@ -930,17 +1286,30 @@ def codec(
     """
     if not (msgpack or json):
         raise ValueError("at least one of `msgpack` / `json` must be enabled")
+    if classes is False and constructors is not None:
+        raise ValueError("`constructors` requires `classes` to not be False")
     if embed_msgpack:
-        return _codec_embed(type, msgpack, json, elide_implied_tag)
+        return _codec_embed(
+            type, msgpack, json, elide_implied_tag, classes, constructors
+        )
     if elide_implied_tag:
         raise ValueError(
             "`elide_implied_tag` requires `embed_msgpack=True`"
+        )
+    if classes or constructors is not None:
+        raise ValueError(
+            "`classes`/`constructors` require `embed_msgpack=True`"
         )
     return _codec_external(type, tensor_encoder, tensor_decoder, force_int64)
 
 
 def _codec_embed(
-    type: Any, msgpack: bool, json: bool, elide_implied_tag: bool = False
+    type: Any,
+    msgpack: bool,
+    json: bool,
+    elide_implied_tag: bool = False,
+    classes: bool | None = None,
+    constructors: ConstructorsSpec = None,
 ) -> str:
     from . import _javascript as _js
 
@@ -949,23 +1318,53 @@ def _codec_embed(
     component_types = _collect_component_types(type_infos)
     name_map = _build_name_map(component_types)
 
-    schema_gen = _SchemaGenerator(name_map, embed=True)
-    jsgen = _js._CodecGenerator(name_map, elide_implied_tag=elide_implied_tag)
+    # Which structs decode into real class instances: those whose resolved
+    # constructor spec is non-None - their own `js_constructor` kwarg, a
+    # `constructors=` fallback, or `classes=True` (fallback `"{**}"`).
+    # `classes=False` forces plain structural output.
+    if classes is False:
+        fallback: Any = UNSET
+    elif constructors is not None:
+        fallback = constructors
+    elif classes:
+        fallback = "{**}"
+    else:
+        fallback = None  # per-class `js_constructor` kwargs only
+    schema_gen = _SchemaGenerator(name_map, embed=True, constructors=fallback)
+    mk_classes = frozenset(
+        cls
+        for cls, t in component_types.items()
+        if isinstance(t, _CODEC_FUNC_TYPES)
+        and not isinstance(t, mi.AbstractStructType)
+        and schema_gen._expanded_for(t) is not None
+    )
+    jsgen = _js._CodecGenerator(
+        name_map, elide_implied_tag=elide_implied_tag, mk_classes=mk_classes
+    )
+
+    def _any_lambdas(src: str) -> str:
+        # JSON *decode* expressions map over `any` input, so their callback
+        # params need explicit `any` annotations to pass `--strict`.
+        return (
+            src.replace(".map((_e) =>", ".map((_e: any) =>")
+            .replace(".map(([_k, _x]) =>", ".map(([_k, _x]: [string, any]) =>")
+            .replace("((_u) => {", "((_u: any) => {")
+        )
 
     parts = [_MSGPACK_RUNTIME_TS.strip()]
     if _contains_tensor(root):
         # Re-export the runtime's TensorHandle (as both a type and a value).
         parts.append("export { TensorHandle };")
 
-    # Type definitions. The codec works with plain objects, so struct shapes are
-    # emitted as `interface` (not `class`) - accurate and `strict`-clean. Enums
-    # and union aliases are unaffected.
+    # Type definitions. Structs that decode to plain objects are emitted as
+    # `interface` (accurate and `strict`-clean); instance-decoding structs
+    # keep their `class` (constructor + `mk`). Enums and union aliases are
+    # unaffected.
     for cls, t in component_types.items():
-        parts.append(
-            schema_gen.to_def(name_map[cls], t).replace(
-                "export class ", "export interface ", 1
-            )
-        )
+        d = schema_gen.to_def(name_map[cls], t)
+        if cls not in mk_classes:
+            d = d.replace("export class ", "export interface ", 1)
+        parts.append(d)
     root_ref = schema_gen.to_ref(root)
     if getattr(root, "cls", None) not in name_map:
         parts.append(f"export type Root = {root_ref};")
@@ -1025,16 +1424,18 @@ def _codec_embed(
             jenc = jenc.replace("const o = tagged ?", "const o: any = tagged ?")
             parts.append(jenc)
             parts.append(
-                _ts_sig_swap(
-                    jsgen.json_dec_def(nm, t),
-                    f"decodeJson{nm}(o)",
-                    f"decodeJson{nm}(o: any): {nm}",
+                _any_lambdas(
+                    _ts_sig_swap(
+                        jsgen.json_dec_def(nm, t),
+                        f"decodeJson{nm}(o)",
+                        f"decodeJson{nm}(o: any): {nm}",
+                    )
                 )
             )
         parts.append(
             "export const json = {\n"
             f"{_INDENT}encode(value: {root_ref}): string {{ return JSON.stringify({jsgen.json_enc(root, 'value')}); }},\n"
-            f"{_INDENT}decode(text: string): {root_ref} {{ const o = JSON.parse(text); return {jsgen.json_dec(root, 'o')}; }},\n"
+            f"{_INDENT}decode(text: string): {root_ref} {{ const o = JSON.parse(text); return {_any_lambdas(jsgen.json_dec(root, 'o'))}; }},\n"
             "};"
         )
 
